@@ -168,38 +168,100 @@ const RETURN_SOURCE = 'Dividends & interest';
 const DEFAULT_ASSUME = {cash:1, bond:2, equity:6, gold:3, property:3, crypto:0, other:2};
 const POLICY_TYPES = ['Life','Health','Critical illness','Accident','Savings / endowment','Home','Car','Other'];
 
-/* ================= State ================= */
-let S = load();
+/* ================= State & storage ================= */
+const KINDS = ['accounts','buckets','holdings','txns','expenses','income','policies','snaps'];
+const MOVES = ['txns','expenses','income'];         // records that move money (carry deltas)
+const DEVICE_KEYS = ['lastBackup','guideLang','lastExpenseHolding','lastIncomeHolding'];
+let S = null;                                         // shared data (synced)
+let DEV = { mode:'local', guideLang:'en' };           // this phone only (never synced)
+let DIRTY = new Map();                                // id -> {kind, del} waiting to sync
 let UI = { tab:'home', bucket:null, sub:null, range:'1Y', chartBucket:'all', spendYear:new Date().getFullYear(), moneyView:'exp' };
 
 function blank(){
-  return { v:2, accounts:[], buckets:[], holdings:[], txns:[], expenses:[], income:[], policies:[], snaps:[], flowB:{},
-    settings:{ budgets:{}, categories:DEFAULT_CATS.slice(), sources:DEFAULT_SOURCES.slice(), assume:{...DEFAULT_ASSUME}, inflation:2,
-      lastBackup:null, created:today(), handover:'' } };
+  return { v:3, accounts:[], buckets:[], holdings:[], txns:[], expenses:[], income:[], policies:[], snaps:[], flowB:{},
+    settings:{ id:'settings', budgets:{}, categories:DEFAULT_CATS.slice(), sources:DEFAULT_SOURCES.slice(), assume:{...DEFAULT_ASSUME}, inflation:2,
+      created:today(), handover:'' } };
 }
-function load(){
-  let d = null;
-  try{ const raw = localStorage.getItem(STORE_KEY); if(raw) d = JSON.parse(raw); }catch(e){ console.warn(e); }
-  return migrate(d);
+/* Tiny IndexedDB key-value store (no 5 MB limit like localStorage) */
+const IDB = { db:null,
+  open(){ return new Promise((res,rej)=>{ try{ const r=indexedDB.open('mywealth',1); r.onupgradeneeded=()=>r.result.createObjectStore('kv'); r.onsuccess=()=>{IDB.db=r.result;res();}; r.onerror=()=>rej(r.error); }catch(e){ rej(e); } }); },
+  get(k){ return new Promise(res=>{ if(!IDB.db) return res(undefined); try{ const t=IDB.db.transaction('kv').objectStore('kv').get(k); t.onsuccess=()=>res(t.result); t.onerror=()=>res(undefined); }catch(e){ res(undefined); } }); },
+  set(k,v){ return new Promise(res=>{ if(!IDB.db) return res(false); try{ const tx=IDB.db.transaction('kv','readwrite'); tx.objectStore('kv').put(v,k); tx.oncomplete=()=>res(true); tx.onerror=()=>res(false); }catch(e){ res(false); } }); },
+  del(k){ return new Promise(res=>{ if(!IDB.db) return res(false); try{ const tx=IDB.db.transaction('kv','readwrite'); tx.objectStore('kv').delete(k); tx.oncomplete=()=>res(true); tx.onerror=()=>res(false); }catch(e){ res(false); } }); }
+};
+async function loadState(){
+  let d = null, dev = null, outbox = null;
+  try{ await IDB.open(); d = await IDB.get('state'); dev = await IDB.get('dev'); outbox = await IDB.get('outbox'); }catch(e){ console.warn('IndexedDB unavailable', e); }
+  if(!d){ try{ const raw = localStorage.getItem(STORE_KEY); if(raw) d = JSON.parse(raw); if(!dev){ const rd = localStorage.getItem(STORE_KEY+'.dev'); if(rd) dev = JSON.parse(rd); } }catch(e){} }
+  DEV = Object.assign({ mode:'local', guideLang:'en' }, dev||{});
+  if(d && d.settings) DEVICE_KEYS.forEach(k=>{ if(d.settings[k]!=null && DEV[k]==null) DEV[k]=d.settings[k]; });
+  S = migrate(d);
+  if(Array.isArray(outbox)) outbox.forEach(([id,kind,del])=>DIRTY.set(id,{kind,del}));
+  recompute();
 }
 function migrate(d){
   if(!d) return blank();
-  const b = blank();
-  const out = Object.assign(b, d);
-  out.settings = Object.assign(blank().settings, d.settings||{});
+  const out = Object.assign(blank(), d);
+  out.settings = Object.assign(blank().settings, d.settings||{}, {id:'settings'});
+  DEVICE_KEYS.forEach(k=>delete out.settings[k]);
   out.settings.assume = Object.assign({...DEFAULT_ASSUME}, out.settings.assume||{});
-  ['income','policies','expenses','txns','snaps','accounts','buckets','holdings'].forEach(k=>{ if(!Array.isArray(out[k])) out[k]=[]; });
-  if(!out.flowB || (d.v||1)<2){ // v1 → v2: start "net money put in" from current cost
-    out.flowB = out.flowB || {};
-    out.buckets.forEach(bk=>{ if(out.flowB[bk.id]==null) out.flowB[bk.id] = out.holdings.filter(h=>h.bucketId===bk.id).reduce((a,h)=>a+(h.cost||0),0); });
+  KINDS.forEach(k=>{ if(!Array.isArray(out[k])) out[k]=[]; });
+  const v = d.v||1;
+  if(v<3){
+    // v1/v2 → v3: balances become "base value + later movements", so two phones can add entries at once
+    const now = Date.now(); const flow = d.flowB || {};
+    out.buckets.forEach(b=>{
+      b.flow0 = flow[b.id]!=null ? flow[b.id] : out.holdings.filter(h=>h.bucketId===b.id).reduce((a,h)=>a+(h.cost||0),0);
+      if(b.baseline) b.baseline = { invested:(b.baseline.invested||0)+(b.baseline.flows||0), at:now };
+      b.at = b.at||now; });
+    out.holdings.forEach(h=>{ h.base=h.value||0; h.baseCost=h.cost||0; h.baseAt=now; h.at=h.at||now; });
+    MOVES.forEach(k=>out[k].forEach(m=>{ m.at = m.at || parseD(m.date).getTime(); m.legacy = true; delete m.d; delete m.f; }));
+    ['accounts','policies'].forEach(k=>out[k].forEach(r=>r.at=r.at||now));
+    out.settings.at = out.settings.at||now;
   }
-  out.v = 2;
+  out.snaps.forEach(sn=>{ if(!sn.id) sn.id='snap-'+sn.d; });
+  delete out.flowB; out.v = 3;
   return out;
 }
-function save(){
-  takeSnapshot();
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){ toast('Could not save on this device: '+e.message); }
+/* Derive balances: holding value = base value + every movement recorded after the base was set */
+function recompute(){
+  const hm = {}; S.holdings.forEach(h=>{ h.value = h.base||0; h.cost = h.baseCost||0; hm[h.id]=h; });
+  const fb = {}; S.buckets.forEach(b=>fb[b.id]=b.flow0||0);
+  MOVES.forEach(k=>S[k].forEach(m=>{
+    (m.d||[]).forEach(x=>{ const h=hm[x.h]; if(h && (m.at||0)>(h.baseAt||0)){ h.value+=x.v||0; h.cost+=x.c||0; } });
+    (m.f||[]).forEach(x=>{ if(fb[x.b]!=null) fb[x.b]+=x.a||0; });
+  }));
+  S.holdings.forEach(h=>{ h.value=Math.round(h.value*100)/100; if(h.type==='cash') h.cost=h.value; });
+  S.flowB = fb;
 }
+function investedFlowsSince(b){
+  if(!b.baseline) return 0; const at=b.baseline.at||0; let tot=0;
+  const ids = new Set(holdingsOf(b.id).filter(h=>h.type!=='cash').map(h=>h.id));
+  MOVES.forEach(k=>S[k].forEach(m=>{ if((m.at||0)>at) (m.d||[]).forEach(x=>{ if(ids.has(x.h)) tot+=x.v||0; }); }));
+  return tot;
+}
+/* Every change goes through put()/drop() so it can be synced */
+function put(kind, rec){
+  rec.at = Date.now();
+  if(kind==='settings'){ S.settings = rec; }
+  else { if(!rec.id) rec.id = uid(); const arr=S[kind]; const i=arr.findIndex(x=>x.id===rec.id); if(i>=0) arr[i]=rec; else arr.push(rec); }
+  if(DEV.mode==='cloud') DIRTY.set(rec.id, {kind, del:false});
+  return rec;
+}
+function drop(kind, id){ S[kind] = S[kind].filter(x=>x.id!==id); if(DEV.mode==='cloud') DIRTY.set(id, {kind, del:true}); }
+const putSettings = () => put('settings', S.settings);
+function save(){ recompute(); takeSnapshot(); persistLocal(); Sync.push(); }
+let _persistT = null;
+function persistLocal(){
+  clearTimeout(_persistT);
+  _persistT = setTimeout(async ()=>{
+    const ok = await IDB.set('state', JSON.parse(JSON.stringify(S)));
+    await IDB.set('outbox', [...DIRTY.entries()].map(([id,x])=>[id,x.kind,x.del]));
+    if(!ok){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){ toast('Could not save on this device: '+e.message); } }
+    else { try{ localStorage.removeItem(STORE_KEY); }catch(e){} }
+  }, 50);
+}
+function saveDev(){ IDB.set('dev', {...DEV}).then(ok=>{ if(!ok) try{ localStorage.setItem(STORE_KEY+'.dev', JSON.stringify(DEV)); }catch(e){} }); }
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 function today(){ return iso(new Date()); }
 function iso(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
@@ -228,15 +290,16 @@ const totalValue = () => sum(S.holdings.map(h=>h.value));
 const flowOf = bid => bid==='all' ? sum(S.buckets.map(b=>S.flowB[b.id]||0)) : (S.flowB[bid]||0);
 const cashHoldings = () => S.holdings.filter(h=>h.type==='cash');
 function holdingLabel(h){ const a=acc(h.accountId), b=bkt(h.bucketId); return `${h.name}${a?' · '+a.name:''}${b?' ('+b.name+')':''}`; }
-function addFlow(bid, amt){ if(!bid) return; S.flowB[bid]=(S.flowB[bid]||0)+amt; }
 function byType(bid){ const out={}; TYPES.forEach(t=>out[t.k]=0); holdingsOf(bid).forEach(h=>out[h.type]=(out[h.type]||0)+h.value); return out; }
 
 function takeSnapshot(){
+  if(!S.holdings.length && !S.snaps.length) return;
   const d = today();
-  const snap = { d, t: Math.round(totalValue()), f: Math.round(flowOf('all')), b:{}, fb:{} };
+  const snap = { id:'snap-'+d, d, t: Math.round(totalValue()), f: Math.round(flowOf('all')), b:{}, fb:{} };
   S.buckets.forEach(b=>{ snap.b[b.id]=Math.round(bucketValue(b.id)); snap.fb[b.id]=Math.round(flowOf(b.id)); });
-  const i = S.snaps.findIndex(s=>s.d===d);
-  if(i>=0) S.snaps[i]=snap; else { S.snaps.push(snap); S.snaps.sort((a,b)=>a.d<b.d?-1:1); }
+  const old = S.snaps.find(x=>x.d===d);
+  if(old && old.t===snap.t && old.f===snap.f && JSON.stringify(old.b)===JSON.stringify(snap.b) && JSON.stringify(old.fb)===JSON.stringify(snap.fb)) return;
+  put('snaps', snap); S.snaps.sort((a,b)=>a.d<b.d?-1:1);
 }
 
 /* ================= Returns, fees, assumptions ================= */
@@ -290,7 +353,7 @@ function analyse(b){
   const due = new Date(last); due.setMonth(due.getMonth()+months);
   if(val>0 && new Date()>=due) reasons.push({lvl:'warn', text:`Scheduled review due (every ${months} months; last ${b.lastReview?fmtDate(b.lastReview):'never'})`});
   if(b.baseline && b.baseline.invested>0){
-    const ch = (val - bt.cash - b.baseline.invested - (b.baseline.flows||0)) / b.baseline.invested * 100;
+    const ch = (val - bt.cash - b.baseline.invested - investedFlowsSince(b)) / b.baseline.invested * 100;
     if(Math.abs(ch) >= (b.moveTrigger ?? 10)) reasons.push({lvl:'serious', text:`Big market move: invested part ${ch>0?'up':'down'} ${Math.abs(ch).toFixed(1)}% since last review`});
   }
   if(Object.values(targets).filter(v=>v>0).length<=1 && rows.length<=1) reasons.length = 0;
@@ -434,8 +497,9 @@ function alerts(){
   const stale = S.holdings.filter(h=>h.type!=='cash' && daysBetween(h.updated||today(), today())>35);
   if(stale.length) out.push({lvl:'warn', text:`${stale.length} holding value${stale.length>1?'s are':' is'} over a month old. Do your monthly check-in.`, go:()=>bulkUpdate()});
   S.policies.forEach(p=>{ if(p.renewal){ const d=daysBetween(today(), p.renewal); if(d>=0 && d<=30) out.push({lvl:'warn', text:`Insurance <b>${esc(p.name)}</b> renews in ${d} day${d===1?'':'s'} (${fmtDate(p.renewal)}).`, go:()=>go({tab:'more',sub:'insurance'})}); } });
-  const lb = S.settings.lastBackup; const hasData = S.holdings.length||S.expenses.length;
-  if(hasData && (!lb || daysBetween(lb, today()) > 14)) out.push({lvl:'warn', text:`Back up your data — ${lb?'last backup '+fmtDate(lb):'no backup yet'}. It lives only on this phone.`, go:()=>exportData()});
+  const lb = DEV.lastBackup; const hasData = S.holdings.length||S.expenses.length;
+  const cloud = DEV.mode==='cloud';
+  if(hasData && (!lb || daysBetween(lb, today()) > (cloud?30:14))) out.push({lvl:'warn', text:`Back up your data — ${lb?'last backup '+fmtDate(lb):'no backup yet'}. ${cloud?'A backup file protects you if the passphrase is ever lost.':'It lives only on this phone.'}`, go:()=>exportData()});
   return out;
 }
 function alertHTML(a,i){ const [c,ic]=LVL[a.lvl]; return `<div class="alert" data-alert="${i}"><span class="ic" style="background:${c}">${ic}</span><div class="grow" style="flex:1">${a.text}</div><span class="chev">›</span></div>`; }
@@ -514,12 +578,12 @@ function renderTabs(){
 function render(){
   renderTabs();
   const app = document.getElementById('app');
-  const fab = document.getElementById('fab'); fab.style.display = (UI.sub==='handover'||UI.sub==='guide') ? 'none' : '';
+  const fab = document.getElementById('fab'); fab.style.display = (UI.sub==='handover'||UI.sub==='guide'||UI.sub==='sync') ? 'none' : '';
   if(UI.tab==='home') app.innerHTML = viewHome();
   else if(UI.tab==='buckets') app.innerHTML = UI.bucket ? viewBucket(UI.bucket) : viewBuckets();
   else if(UI.tab==='money') app.innerHTML = viewMoney();
   else if(UI.tab==='plan') app.innerHTML = viewPlan();
-  else app.innerHTML = UI.sub==='guide' ? viewGuide() : UI.sub==='insurance' ? viewInsurance() : UI.sub==='handover' ? viewHandover() : UI.sub==='accounts' ? viewAccounts() : viewMore();
+  else app.innerHTML = UI.sub==='guide' ? viewGuide() : UI.sub==='sync' ? viewSync() : UI.sub==='insurance' ? viewInsurance() : UI.sub==='handover' ? viewHandover() : UI.sub==='accounts' ? viewAccounts() : viewMore();
   bindView();
   if(!UI.keepScroll) window.scrollTo(0,0); UI.keepScroll=false;
 }
@@ -527,7 +591,7 @@ const rangeChips = () => `<div class="chips" style="margin-top:6px">${['1M','3M'
 const backBtn = (label, state) => `<button class="ghost no-print" data-back='${JSON.stringify(state)}' style="margin-left:-8px">‹ ${label}</button>`;
 
 function viewHome(){
-  if(!S.accounts.length && !S.buckets.length) return viewWelcome();
+  if(!S.accounts.length && !S.buckets.length && !(DEV.mode==='cloud' && Sync.state!=='on')) return viewWelcome();
   const tv = totalValue(), put = flowOf('all'), gain = tv-put;
   const m30 = (()=>{ const c=new Date(); c.setDate(c.getDate()-30); const ci=iso(c); return [...S.snaps].reverse().find(x=>x.d<=ci); })();
   const al = alerts(); UI._alerts = al;
@@ -536,7 +600,7 @@ function viewHome(){
   const avgFund = goals.length ? Math.min(...goals.map(g=>g.funded)) : null;
   const tile = (go, lbl, v, state, s) => `<div class="tile" data-go="${go}"><div class="lbl">${lbl}</div><div class="v">${v}</div><div class="s"><span class="dot" style="background:${LVL[state][0]};width:8px;height:8px"></span>${s}</div></div>`;
   return `
-  <div class="row between"><h1>My Wealth</h1><button class="helpbtn" data-act="openGuide" aria-label="How to use this app" title="How to use this app">?</button></div>
+  <div class="row between"><h1>My Wealth</h1><div class="row" style="gap:8px">${syncPill()}<button class="helpbtn" data-act="openGuide" aria-label="How to use this app" title="How to use this app">?</button></div></div>
   <div class="card">
     <div class="faint">Total wealth</div>
     <div class="hero">${B(tv)}</div>
@@ -576,10 +640,11 @@ function viewWelcome(){
   <li><b>Buckets</b> — what money is for (Emergency, Education, Growth…) and its target mix.</li>
   <li><b>Holdings</b> — inside a bucket: each piece of money, its account, type and value.</li></ol>
   <button class="primary block" data-act="addAccount">1. Add your first account</button>
+  <div style="height:8px"></div><button class="block" data-act="openSync">☁ Join family sync instead</button>
   <div style="height:8px"></div><button class="block" data-act="addBucket">2. Add a bucket</button>
   </div>
   <div class="card tap row" data-act="openGuide"><span class="ic" style="background:var(--accent-soft);width:36px;height:36px;font-size:18px">📖</span><div style="flex:1"><b>How to use this app</b><div class="faint">A short guide in English and ภาษาไทย</div></div><span class="chev">›</span></div>
-  <div class="card"><h2>Just looking?</h2><p class="muted">Load example data to see how everything works. Wipe it later in More → Clear all data.</p><button class="block" data-act="demo">Load example data</button></div>`;
+  ${DEV.mode==='cloud'?'':`<div class="card"><h2>Just looking?</h2><p class="muted">Load example data to see how everything works. Wipe it later in More → Clear all data.</p><button class="block" data-act="demo">Load example data</button></div>`}`;
 }
 
 function viewBuckets(){
@@ -757,13 +822,14 @@ function viewPlan(){
 
 /* ---------- More ---------- */
 function viewMore(){
-  const lb = S.settings.lastBackup;
+  const lb = DEV.lastBackup;
   const item = (act, ico, title, sub) => `<div class="list-item" data-act="${act}"><span class="ico">${ico}</span><div class="grow"><div class="title">${title}</div><div class="faint">${sub}</div></div><span class="chev">›</span></div>`;
   return `<h1>More</h1>
   <div class="card menu">
     ${item('openGuide','📖','How to use this app','Step-by-step guide · English / ภาษาไทย')}
   </div>
   <div class="card menu">
+    ${item('openSync','☁️','Family sync', DEV.mode==='cloud' ? 'On — '+esc(DEV.email||'') : 'Share live data with your wife\'s phone')}
     ${item('openAccounts','🏦','Accounts',`${S.accounts.length} account${S.accounts.length===1?'':'s'} — banks, funds, brokers`)}
     ${item('openInsurance','🛡️','Insurance policies',`${S.policies.length} polic${S.policies.length===1?'y':'ies'} — coverage, premiums, renewals`)}
     ${item('openHandover','📋','Family handover','A printable summary for your family')}
@@ -775,13 +841,13 @@ function viewMore(){
     ${item('editAssume','📈','Return assumptions','Expected returns and inflation')}
   </div>
   <div class="card"><h2>Backup</h2>
-    <p class="help">Your data is only on this phone. Back up every week or two and save the file to Google Drive.</p>
+    <p class="help">${DEV.mode==='cloud' ? 'Family sync keeps a cloud copy, but a backup file protects you if the passphrase is ever lost. Back up every few weeks.' : 'Your data is only on this phone. Back up every week or two and save the file to Google Drive.'}</p>
     <div class="faint">Last backup: ${lb?fmtDate(lb):'never'}</div>
     <div class="actions"><button class="primary" data-act="export">Back up now</button><button data-act="import">Restore</button></div>
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v1.2 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.0 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -831,7 +897,7 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
    <li><b>Holding</b> — one piece of money inside a bucket. Example: "S&amp;P500 fund, ฿500,000, in InnovestX funds, belongs to Growth".</li>
   </ul>
   <p>One account can hold money for several buckets, and one bucket can use several accounts. That's normal.</p>
-  <p class="rec">🔒 Your data stays <b>only on this phone</b>. Nothing is sent to the internet. That's why backups matter (see "Backup").</p>`},
+  <p class="rec">🔒 Your data stays <b>on your phone</b>. If you turn on <b>Family sync</b>, an encrypted copy is shared with your wife's phone through your own Firebase project. Back up now and then either way (see "Backup").</p>`},
  {i:'🚀', t:'Getting started (10 minutes)', b:`
   <ol>
    <li>Go to <b>More → Accounts → + Add account</b>. Add each bank account, fund account and broker you use.</li>
@@ -902,6 +968,17 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>Back up:</b> <b>More → Back up now</b> → choose <b>Drive</b> (Google Drive) and save. Do it every week or two. The app reminds you after 14 days.</p>
   <p><b>Restore / new phone:</b> install the app on the new phone (open your link in Chrome → ⋮ → Install), then <b>More → Restore</b> and pick your latest backup file.</p>
   <p class="faint">Restoring replaces everything on that phone with the backup.</p>`},
+ {i:'☁️', t:'Family sync — sharing with a second phone', b:`
+  <p>With family sync on, you and your wife share the same data live. Either phone can add expenses, record income or update values, and the other phone sees it within seconds.</p>
+  <ul>
+   <li><b>Free</b> — it uses your own free Google Firebase project.</li>
+   <li><b>Private</b> — only the two sign-ins you created can get in.</li>
+   <li><b>Encrypted</b> — data is locked with your <b>family passphrase</b> on the phone before it's uploaded. Not even Google can read it.</li>
+   <li><b>Works offline</b> — changes are kept and sync when you're back online. If you both add something at the same time, nothing is lost.</li>
+  </ul>
+  <p><b>Joining on a new phone:</b> install the app → <b>More → Family sync → Join</b> → paste the setup code (from the first phone: More → Family sync → Copy setup code) → sign in → enter the family passphrase.</p>
+  <p>The <b>☁ Synced</b> badge at the top of Home shows the status. Tap it for details.</p>
+  <p class="rec">⚠️ If both of you forget the passphrase, the cloud data can't be recovered. Keep it written down, and keep making backup files now and then.</p>`},
  {i:'📚', t:'Words used in the app', b:`
   <ul>
    <li><b>Target mix</b> — how you want a bucket split between cash, bonds, equity, etc.</li>
@@ -917,7 +994,7 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>Why doesn't the app show live prices?</b> Your funds and banks don't offer a connection for personal apps. A monthly check-in is enough for long-term investing.</p>
   <p><b>The numbers look wrong.</b> Do a monthly check-in, then check cash balances with <b>Correct balance</b>.</p>
   <p><b>I can't see the new version after an update.</b> Close the app fully and open it again (sometimes twice).</p>
-  <p><b>Can my wife use it on her phone?</b> Yes — install the same link. Each phone keeps its own data. To share, back up on one phone and restore on the other.</p>
+  <p><b>Can my wife use it on her phone?</b> Yes — turn on <b>Family sync</b> (see that topic) and you'll both see the same data live.</p>
   <p><b>Is this financial advice?</b> No. The app does arithmetic on your own numbers and assumptions. Projections are estimates, not promises.</p>`}
 ]},
 th: { title:'วิธีใช้แอป', intro:'ทุกอย่างที่ต้องรู้ อธิบายแบบเข้าใจง่าย แตะหัวข้อเพื่อเปิดอ่าน', sections:[
@@ -930,7 +1007,7 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
    <li><b>รายการเงิน (Holding)</b> — เงินแต่ละก้อนในกระเป๋า เช่น "กองทุน S&amp;P500 ฿500,000 อยู่ในบัญชีกองทุน InnovestX เป็นของกระเป๋าลงทุนระยะยาว"</li>
   </ul>
   <p>บัญชีเดียวอาจมีเงินของหลายกระเป๋า และกระเป๋าเดียวอาจใช้หลายบัญชีได้ เป็นเรื่องปกติ</p>
-  <p class="rec">🔒 ข้อมูลอยู่ <b>ในโทรศัพท์เครื่องนี้เท่านั้น</b> ไม่ถูกส่งขึ้นอินเทอร์เน็ต จึงต้องสำรองข้อมูลเป็นประจำ (ดูหัวข้อ "สำรองข้อมูล")</p>`},
+  <p class="rec">🔒 ข้อมูลอยู่ <b>ในโทรศัพท์ของเรา</b> ถ้าเปิด <b>Family sync</b> ข้อมูลที่เข้ารหัสแล้วจะแชร์กับโทรศัพท์ภรรยาผ่านโปรเจกต์ Firebase ของเราเอง ไม่ว่าแบบไหนก็ควรสำรองข้อมูลเป็นระยะ (ดูหัวข้อ "สำรองข้อมูล")</p>`},
  {i:'🚀', t:'เริ่มต้นใช้งาน (10 นาที)', b:`
   <ol>
    <li>ไปที่ <b>More → Accounts → + Add account</b> เพิ่มบัญชีธนาคาร บัญชีกองทุน และบัญชีหุ้นที่ใช้</li>
@@ -1001,6 +1078,17 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>สำรอง:</b> <b>More → Back up now</b> → เลือก <b>Drive</b> (Google Drive) แล้วบันทึก ทำทุก 1–2 สัปดาห์ แอปจะเตือนเมื่อครบ 14 วัน</p>
   <p><b>กู้คืน / เครื่องใหม่:</b> ติดตั้งแอปในเครื่องใหม่ (เปิดลิงก์ใน Chrome → ⋮ → Install) แล้วไปที่ <b>More → Restore</b> เลือกไฟล์สำรองล่าสุด</p>
   <p class="faint">การกู้คืนจะแทนที่ข้อมูลทั้งหมดในเครื่องนั้นด้วยข้อมูลจากไฟล์สำรอง</p>`},
+ {i:'☁️', t:'ซิงค์ข้อมูลครอบครัว — ใช้ร่วมกับโทรศัพท์อีกเครื่อง', b:`
+  <p>เมื่อเปิดซิงค์ครอบครัว เราและภรรยาจะเห็นข้อมูลชุดเดียวกันแบบเรียลไทม์ ใครบันทึกรายจ่าย รายได้ หรืออัปเดตมูลค่า อีกเครื่องจะเห็นภายในไม่กี่วินาที</p>
+  <ul>
+   <li><b>ฟรี</b> — ใช้โปรเจกต์ Google Firebase ฟรีของเราเอง</li>
+   <li><b>เป็นส่วนตัว</b> — เข้าได้เฉพาะสองบัญชีที่เราสร้างไว้</li>
+   <li><b>เข้ารหัส</b> — ข้อมูลถูกล็อกด้วย <b>รหัสผ่านครอบครัว (passphrase)</b> ในโทรศัพท์ก่อนอัปโหลด แม้แต่ Google ก็อ่านไม่ได้</li>
+   <li><b>ใช้ได้แม้ไม่มีเน็ต</b> — ข้อมูลจะเก็บไว้และซิงค์เมื่อกลับมาออนไลน์ ถ้าบันทึกพร้อมกันสองเครื่อง ข้อมูลจะไม่หาย</li>
+  </ul>
+  <p><b>เพิ่มโทรศัพท์เครื่องใหม่:</b> ติดตั้งแอป → <b>More → Family sync → Join</b> → วาง setup code (จากเครื่องแรก: More → Family sync → Copy setup code) → ลงชื่อเข้าใช้ → ใส่รหัสผ่านครอบครัว</p>
+  <p>ป้าย <b>☁ Synced</b> ที่ด้านบนหน้า Home แสดงสถานะ แตะเพื่อดูรายละเอียด</p>
+  <p class="rec">⚠️ ถ้าลืมรหัสผ่านครอบครัวทั้งสองคน ข้อมูลบนคลาวด์จะกู้คืนไม่ได้ จดไว้ให้ดี และสำรองข้อมูลเป็นไฟล์เป็นระยะ</p>`},
  {i:'📚', t:'คำศัพท์ในแอป', b:`
   <ul>
    <li><b>Target mix</b> — สัดส่วนที่ต้องการในกระเป๋า ระหว่างเงินสด ตราสารหนี้ หุ้น ฯลฯ</li>
@@ -1016,18 +1104,272 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>ทำไมแอปไม่แสดงราคาแบบเรียลไทม์?</b> กองทุนและธนาคารไม่เปิดให้แอปส่วนตัวเชื่อมต่อ การอัปเดตเดือนละครั้งเพียงพอสำหรับการลงทุนระยะยาว</p>
   <p><b>ตัวเลขดูไม่ถูก</b> ทำ Monthly check-in แล้วตรวจยอดเงินสดด้วย <b>Correct balance</b></p>
   <p><b>อัปเดตแล้วไม่เห็นเวอร์ชันใหม่</b> ปิดแอปให้สนิทแล้วเปิดใหม่ (บางครั้งต้องทำ 2 รอบ)</p>
-  <p><b>ภรรยาใช้ในโทรศัพท์ของเธอได้ไหม?</b> ได้ ติดตั้งจากลิงก์เดียวกัน แต่ละเครื่องเก็บข้อมูลแยกกัน ถ้าจะใช้ข้อมูลเดียวกัน ให้สำรองจากเครื่องหนึ่งแล้วกู้คืนในอีกเครื่อง</p>
+  <p><b>ภรรยาใช้ในโทรศัพท์ของเธอได้ไหม?</b> ได้ เปิด <b>Family sync</b> (ดูหัวข้อซิงค์ข้อมูลครอบครัว) แล้วทั้งสองเครื่องจะเห็นข้อมูลเดียวกันแบบเรียลไทม์</p>
   <p><b>นี่คือคำแนะนำทางการเงินไหม?</b> ไม่ใช่ แอปแค่คำนวณจากตัวเลขและสมมติฐานของเราเอง ตัวเลขคาดการณ์เป็นการประมาณ ไม่ใช่การรับประกัน</p>`}
 ]}
 };
 function viewGuide(){
-  const lang = S.settings.guideLang || 'en'; const G = GUIDE[lang];
+  const lang = DEV.guideLang || 'en'; const G = GUIDE[lang];
   return `${backBtn('Back',{tab:'more'})}
   <div class="row between"><h1 style="margin-top:0">📖 ${G.title}</h1></div>
   <div class="segctl"><button class="${lang==='en'?'on':''}" data-lang="en">English</button><button class="${lang==='th'?'on':''}" data-lang="th">ภาษาไทย</button></div>
   <p class="help">${G.intro}</p>
   <div class="card guide">${G.sections.map((s,i)=>`<details ${UI.guideOpen===i?'open':''} data-gi="${i}"><summary><span class="gico">${s.i}</span><span style="flex:1">${s.t}</span><span class="chev">›</span></summary><div class="gbody">${s.b}</div></details>`).join('')}</div>`;
 }
+
+/* ================= Family sync (Firebase) + passphrase encryption ================= */
+const FB_VER = '13.4.0';
+const b64 = u8 => { let s=''; for(let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null, u8.subarray(i,i+0x8000)); return btoa(s); };
+const unb64 = t => Uint8Array.from(atob(t), c=>c.charCodeAt(0));
+async function deriveKey(pass, saltB64){
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass.normalize('NFC')), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt:unb64(saltB64), iterations:310000, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+async function encrypt(key, obj){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const c = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return { iv:b64(iv), c:b64(new Uint8Array(c)) };
+}
+async function decrypt(key, d){
+  const p = await crypto.subtle.decrypt({name:'AES-GCM', iv:unb64(d.iv)}, key, unb64(d.c));
+  return JSON.parse(new TextDecoder().decode(p));
+}
+function parseCfg(text){
+  text = String(text||'').trim();
+  try{ if(text.startsWith('MW1.')) { const o = JSON.parse(decodeURIComponent(escape(atob(text.slice(4))))); if(o.apiKey && o.projectId) return o; } }catch(e){}
+  const o = {}; const re = /(apiKey|authDomain|projectId|storageBucket|messagingSenderId|appId)\s*:\s*["']([^"']+)["']/g; let m;
+  while((m = re.exec(text))) o[m[1]] = m[2];
+  return (o.apiKey && o.projectId) ? o : null;
+}
+const setupCode = () => DEV.cfg ? 'MW1.' + btoa(unescape(encodeURIComponent(JSON.stringify({apiKey:DEV.cfg.apiKey, authDomain:DEV.cfg.authDomain, projectId:DEV.cfg.projectId, appId:DEV.cfg.appId})))) : '';
+function fbError(e){
+  const c = (e && (e.code||'')) + ' ' + (e && e.message || e);
+  if(/invalid-credential|wrong-password|user-not-found|invalid-email|invalid-login/.test(c)) return 'Email or password is wrong. Check the user you added in Firebase → Authentication.';
+  if(/permission-denied|insufficient permissions/i.test(c)) return 'Firebase refused access. Check that this person\'s User UID is in the Firestore rules, then tap Publish.';
+  if(/network|unavailable|offline|Failed to fetch|importing a module/i.test(c)) return 'No connection to Firebase. Check your internet and try again.';
+  if(/api-key|API key/i.test(c)) return 'The setup code / Firebase settings look wrong. Paste them again.';
+  if(/too-many-requests/.test(c)) return 'Too many attempts. Wait a few minutes and try again.';
+  return 'Something went wrong: ' + (e && e.message || e);
+}
+const Sync = {
+  F:null, app:null, auth:null, db:null, user:null, key:null, unsub:null, state:'off', err:'', pushing:false, again:false,
+  async load(){
+    if(this.F) return this.F;
+    const base = DEV.mockFb || `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+    const [a,b,c] = await Promise.all([import(base+'firebase-app.js'), import(base+'firebase-auth.js'), import(base+'firebase-firestore.js')]);
+    this.F = Object.assign({}, a, b, c); return this.F;
+  },
+  async init(){
+    const F = await this.load();
+    if(!this.app){
+      this.app = F.initializeApp(DEV.cfg); this.auth = F.getAuth(this.app);
+      try{ this.db = F.initializeFirestore(this.app, { localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) }); }
+      catch(e){ this.db = F.initializeFirestore(this.app, {}); }
+    }
+    return F;
+  },
+  currentUser(){ return new Promise(res=>{ const off = this.F.onAuthStateChanged(this.auth, u=>{ try{ off(); }catch(e){} res(u); }); }); },
+  async signIn(email, pw){ const F = await this.init(); const c = await F.signInWithEmailAndPassword(this.auth, email.trim(), pw); this.user = c.user; DEV.email = c.user.email; saveDev(); return c.user; },
+  async vault(){ const F=this.F; const snap = await F.getDoc(F.doc(this.db,'meta','vault')); return snap.exists() ? snap.data() : null; },
+  async createVault(pass){
+    const F=this.F; const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
+    const key = await deriveKey(pass, salt); const check = await encrypt(key, {ok:'mywealth'});
+    await F.setDoc(F.doc(this.db,'meta','vault'), { salt, check, created:Date.now(), v:1 });
+    this.key = key; await IDB.set('vaultKey', key);
+  },
+  async unlock(pass, meta){
+    const key = await deriveKey(pass, meta.salt);
+    try{ const o = await decrypt(key, meta.check); if(o.ok!=='mywealth') throw 0; }catch(e){ throw new Error('WRONG_PASS'); }
+    this.key = key; await IDB.set('vaultKey', key);
+  },
+  markAll(){ KINDS.forEach(k=>S[k].forEach(r=>DIRTY.set(r.id,{kind:k,del:false}))); DIRTY.set('settings',{kind:'settings',del:false}); },
+  async push(){
+    if(DEV.mode!=='cloud' || !this.key || !this.db || !this.user) return;
+    if(this.pushing){ this.again = true; return; }
+    this.pushing = true;
+    try{
+      do{
+        this.again = false;
+        const items = [...DIRTY.entries()]; if(!items.length) break;
+        for(let i=0;i<items.length;i+=400){
+          const chunk = items.slice(i,i+400); const batch = this.F.writeBatch(this.db);
+          for(const [id,{kind,del}] of chunk){
+            const rec = kind==='settings' ? S.settings : S[kind]?.find(x=>x.id===id);
+            const payload = (del || !rec) ? {k:kind, del:true, at:Date.now()} : {k:kind, r:stripRec(kind, rec)};
+            const enc = await encrypt(this.key, payload);
+            batch.set(this.F.doc(this.db,'items',id), { iv:enc.iv, c:enc.c, del:!!payload.del, ts:this.F.serverTimestamp() });
+          }
+          // Firestore keeps these writes safely on the phone and sends them when online
+          batch.commit().catch(e=>{ this.state='error'; this.err=fbError(e); scheduleRender(); });
+          chunk.forEach(([id])=>DIRTY.delete(id));
+        }
+        IDB.set('outbox', [...DIRTY.entries()].map(([id,x])=>[id,x.kind,x.del]));
+      } while(this.again);
+    } catch(e){ console.warn(e); }
+    this.pushing = false;
+  },
+  listen(){
+    const F=this.F; if(this.unsub) this.unsub();
+    const since = Math.max(0, (DEV.lastTs||0) - 120000);
+    const q = F.query(F.collection(this.db,'items'), F.where('ts','>', F.Timestamp.fromMillis(since)));
+    this.unsub = F.onSnapshot(q, snap=>this.onSnap(snap), e=>{ this.state='error'; this.err=fbError(e); scheduleRender(); });
+    this.state = 'on'; this.err='';
+  },
+  async onSnap(snap){
+    const changes = snap.docChanges().filter(c=>c.type!=='removed' && !c.doc.metadata.hasPendingWrites);
+    if(this.state!=='on'){ this.state='on'; this.err=''; scheduleRender(); }
+    if(!changes.length) return;
+    let maxTs = DEV.lastTs||0, changed = false;
+    for(const c of changes){
+      const data = c.doc.data(); if(data.ts && data.ts.toMillis) maxTs = Math.max(maxTs, data.ts.toMillis());
+      let o; try{ o = await decrypt(this.key, data); }catch(e){ console.warn('could not decrypt', c.doc.id); continue; }
+      if(applyRemote(c.doc.id, o)) changed = true;
+    }
+    DEV.lastTs = maxTs; saveDev();
+    if(changed){ recompute(); persistLocal(); scheduleRender(); }
+  },
+  async resume(){
+    try{
+      await this.init();
+      const u = await this.currentUser();
+      if(!u){ this.state='signedout'; scheduleRender(); return; }
+      this.user = u;
+      const key = await IDB.get('vaultKey');
+      if(!key){ this.state='locked'; scheduleRender(); return; }
+      this.key = key; this.listen(); this.push(); scheduleRender();
+    }catch(e){ this.state='offline'; this.err=fbError(e); scheduleRender(); }
+  },
+  async stop(){ try{ if(this.unsub) this.unsub(); if(this.auth) await this.F.signOut(this.auth); }catch(e){} this.unsub=null; this.user=null; this.key=null; this.state='off';
+    await IDB.del('vaultKey'); DIRTY.clear(); DEV.mode='local'; DEV.lastTs=0; saveDev(); persistLocal(); }
+};
+function stripRec(kind, r){ if(kind!=='holdings') return r; const {value, cost, ...rest} = r; return rest; }
+function applyRemote(id, o){
+  const kind = o.k;
+  if(kind==='settings'){ if(o.r && (!S.settings.at || (o.r.at||0) >= S.settings.at)){ S.settings = Object.assign(blank().settings, o.r); return true; } return false; }
+  if(!KINDS.includes(kind)) return false;
+  const arr = S[kind]; const i = arr.findIndex(x=>x.id===id);
+  if(o.del){ if(i>=0 && (arr[i].at||0) <= (o.at||0)){ arr.splice(i,1); return true; } return false; }
+  if(i<0){ arr.push(o.r); if(kind==='snaps') arr.sort((a,b)=>a.d<b.d?-1:1); return true; }
+  if((arr[i].at||0) <= (o.r.at||0)){ arr[i] = o.r; return true; }
+  return false;
+}
+let _rT = null;
+function scheduleRender(){ clearTimeout(_rT); _rT = setTimeout(()=>{ UI.keepScroll = true; render(); }, 250); }
+
+function syncPill(){
+  if(DEV.mode!=='cloud') return '';
+  const st = Sync.state==='on' ? (navigator.onLine===false ? ['warn','Offline — will sync'] : ['good','Synced'])
+    : Sync.state==='locked' ? ['warn','Locked — tap to unlock'] : Sync.state==='signedout' ? ['warn','Signed out — tap'] : Sync.state==='error' ? ['crit','Sync problem — tap'] : Sync.state==='offline' ? ['warn','Offline — will sync'] : ['none','Connecting…'];
+  return `<button class="badge" data-act="openSync" style="border:0;min-height:30px;cursor:pointer"><span class="dot" style="background:${LVL[st[0]][0]};width:8px;height:8px"></span>☁ ${st[1]}</button>`;
+}
+
+function viewSync(){
+  const head = `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">☁ Family sync</h1>`;
+  const step = UI.syncStep || 'intro';
+  // ---- sync is on
+  if(DEV.mode==='cloud'){
+    if(Sync.state==='signedout') return head + signInCard('Signed out on this phone. Sign in again to keep syncing.');
+    if(Sync.state==='locked') return head + passCard(false, 'Enter the family passphrase to unlock your data on this phone.');
+    const ok = Sync.state==='on';
+    return head + `<div class="card"><div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${ok?'var(--good)':Sync.state==='error'?'var(--crit)':'var(--warn)'}">${ok?'✓':'!'}</span><div><b>${ok?'Sync is on':Sync.state==='error'?'Sync problem':'Waiting for connection'}</b><div class="faint">${ok?'Changes on either phone appear on the other within seconds.':esc(Sync.err||'Changes are saved on this phone and will sync when back online.')}</div></div></div>
+      <div class="kv"><span class="k">Signed in as</span><b>${esc(DEV.email||Sync.user?.email||'')}</b></div>
+      <div class="kv"><span class="k">Firebase project</span><b>${esc(DEV.cfg?.projectId||'')}</b></div>
+      <div class="kv"><span class="k">Encryption</span><b>🔒 Family passphrase</b></div></div>
+    <div class="card"><h2>Add another phone</h2><p class="help">On the other phone: install the app, open More → Family sync → <b>Join</b>, and paste this setup code. Send it by LINE or similar — it's not secret on its own (it doesn't contain passwords or the passphrase).</p>
+      <textarea readonly rows="3" id="scode" style="font-size:12px">${esc(setupCode())}</textarea>
+      <button class="primary block" style="margin-top:8px" data-act="copyCode">Copy setup code</button></div>
+    <div class="card"><h2>This phone</h2>
+      <button class="block" data-act="syncStop">Stop syncing on this phone</button>
+      <p class="faint">Signs out and keeps a copy of the data on this phone. The other phone and the cloud copy are not affected.</p></div>`;
+  }
+  // ---- setting up
+  if(step==='intro') return head + `<div class="card"><p>Share the same data between your phone and your wife's phone, live. Either of you can add expenses or update values, and the other phone sees it within seconds.</p>
+      <ul style="padding-left:20px;margin:6px 0 10px"><li>Free — uses your own free Google Firebase project.</li><li>Private — only the two accounts you create can get in.</li><li>Encrypted — data is locked with a family passphrase before it leaves the phone, so even Google can't read it.</li><li>Works offline — changes sync when you're back online.</li></ul>
+      <p class="help">You need to create the Firebase project first (about 20 minutes, once). See the installation guide.</p></div>
+    <div class="card tap row" data-sstep="first"><span class="ic" style="background:var(--accent-soft);width:36px;height:36px;font-size:18px">1️⃣</span><div style="flex:1"><b>Set up on the first phone</b><div class="faint">Your data on this phone becomes the family data</div></div><span class="chev">›</span></div>
+    <div class="card tap row" data-sstep="join"><span class="ic" style="background:var(--accent-soft);width:36px;height:36px;font-size:18px">2️⃣</span><div style="flex:1"><b>Join from another phone</b><div class="faint">Use the setup code from the first phone</div></div><span class="chev">›</span></div>`;
+  if(step==='first' || step==='join') {
+    const first = step==='first';
+    return head + `<div class="card"><h2>${first?'Step 1 of 3 — Firebase settings':'Step 1 of 3 — Setup code'}</h2>
+      <p class="help">${first?'In the Firebase console: Project settings (⚙️) → Your apps → your web app → copy the whole <b>firebaseConfig</b> block and paste it here.':'On the first phone: More → Family sync → <b>Copy setup code</b>. Paste it here.'}</p>
+      <textarea id="cfgIn" rows="7" placeholder="${first?'const firebaseConfig = {\n  apiKey: &quot;…&quot;,\n  authDomain: &quot;…&quot;,\n  projectId: &quot;…&quot;,\n  …\n};':'MW1.…'}" style="font-size:13px"></textarea>
+      <div class="actions"><button data-sstep="intro">Back</button><button class="primary" data-act="cfgSave" data-id="${step}">Next</button></div></div>`;
+  }
+  if(step==='signin') return head + signInCard(UI.syncFirst ? 'Step 2 of 3 — Sign in with the user you created for yourself in Firebase.' : 'Step 2 of 3 — Sign in with the user created for this phone\'s owner in Firebase.');
+  if(step==='create') return head + passCard(true);
+  if(step==='unlock') return head + passCard(false, 'Step 3 of 3 — Enter the family passphrase (the one chosen on the first phone).');
+  return head;
+}
+function signInCard(msg){
+  return `<div class="card"><h2>Sign in</h2><p class="help">${msg}</p>
+    <label>Email</label><input id="siEmail" type="email" autocomplete="username" value="${esc(DEV.email||'')}">
+    <label>Password</label><input id="siPass" type="password" autocomplete="current-password">
+    <div id="siErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions">${DEV.mode!=='cloud'?'<button data-sstep="intro">Cancel</button>':''}<button class="primary" data-act="syncSignIn">Sign in</button></div></div>`;
+}
+function passCard(create, msg){
+  if(create) return `<div class="card"><h2>Step 3 of 3 — Family passphrase</h2>
+    <p class="help">Your data is locked with this passphrase before it's uploaded. You'll type it once on each phone.</p>
+    <div class="rec">⚠️ <b>If both of you forget it, the data in the cloud can't be recovered</b> — not by you, me, or Google. Write it down and keep it with your important documents. Use 4+ random words, e.g. <i>mango river purple 1987</i>.</div>
+    <label>Passphrase</label><input id="pp1" type="password" autocomplete="new-password">
+    <label>Type it again</label><input id="pp2" type="password" autocomplete="new-password">
+    <label class="check"><input type="checkbox" id="ppOk"><span>I've written it down somewhere safe</span></label>
+    <div id="ppErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions"><button class="primary" data-act="syncCreate">Turn on family sync</button></div></div>`;
+  return `<div class="card"><h2>Family passphrase</h2><p class="help">${msg}</p>
+    <label>Passphrase</label><input id="pp1" type="password" autocomplete="current-password">
+    ${DEV.mode!=='cloud' && (S.holdings.length||S.expenses.length) ? `<div class="rec">This phone already has data. It will be <b>replaced</b> by the family data. Back up first (More → Back up now) if you need it.</div>`:''}
+    <div id="ppErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions"><button class="primary" data-act="syncUnlock">Unlock</button></div></div>`;
+}
+const busy = (btn, on, label) => { if(!btn) return; btn.disabled = on; if(on){ btn.dataset.l = btn.textContent; btn.textContent = label||'Please wait…'; } else if(btn.dataset.l) btn.textContent = btn.dataset.l; };
+const SYNC_ACT = {
+  cfgSave: async (step, btn)=>{
+    const cfg = parseCfg(document.getElementById('cfgIn').value);
+    if(!cfg) return toast(step==='first' ? 'Couldn\'t find apiKey and projectId. Copy the whole firebaseConfig block.' : 'That setup code doesn\'t look right. Copy it again.');
+    if(DEV.cfg && DEV.cfg.projectId!==cfg.projectId && Sync.app) return toast('Close and reopen the app, then try again.');
+    DEV.cfg = cfg; UI.syncFirst = step==='first'; saveDev();
+    busy(btn, true, 'Connecting…');
+    try{ await Sync.init(); UI.syncStep='signin'; render(); }catch(e){ busy(btn,false); toast(fbError(e)); }
+  },
+  syncSignIn: async (_, btn)=>{
+    const email = document.getElementById('siEmail').value, pw = document.getElementById('siPass').value, err = document.getElementById('siErr');
+    if(!email || !pw) return err.textContent = 'Enter email and password.';
+    busy(btn, true, 'Signing in…'); err.textContent='';
+    try{
+      await Sync.signIn(email, pw);
+      if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); Sync.push(); } else Sync.state='locked'; render(); return; }
+      const meta = await Sync.vault();
+      UI.syncStep = meta ? 'unlock' : 'create'; UI.vaultMeta = meta; render();
+    }catch(e){ busy(btn,false); err.textContent = fbError(e); }
+  },
+  syncCreate: async (_, btn)=>{
+    const p1 = document.getElementById('pp1').value, p2 = document.getElementById('pp2').value, err = document.getElementById('ppErr');
+    if(p1.length < 10) return err.textContent = 'Use at least 10 characters (4 random words is ideal).';
+    if(p1 !== p2) return err.textContent = 'The two passphrases don\'t match.';
+    if(!document.getElementById('ppOk').checked) return err.textContent = 'Please write it down first, then tick the box.';
+    busy(btn, true, 'Encrypting and uploading…');
+    try{
+      if(await Sync.vault()){ busy(btn,false); UI.syncStep='unlock'; UI.vaultMeta = await Sync.vault(); render(); return toast('A family vault already exists — enter its passphrase'); }
+      await Sync.createVault(p1);
+      DEV.mode = 'cloud'; DEV.lastTs = 0; saveDev();
+      Sync.markAll(); persistLocal(); await Sync.push(); Sync.listen();
+      UI.syncStep = null; render(); toast('Family sync is on');
+    }catch(e){ busy(btn,false); err.textContent = fbError(e); }
+  },
+  syncUnlock: async (_, btn)=>{
+    const p1 = document.getElementById('pp1').value, err = document.getElementById('ppErr');
+    busy(btn, true, 'Unlocking…'); err.textContent='';
+    try{
+      const meta = UI.vaultMeta || await Sync.vault(); if(!meta) throw new Error('No family vault found yet — set up the first phone first.');
+      await Sync.unlock(p1, meta);
+      if(DEV.mode!=='cloud'){ S = blank(); S.settings.at = 0; DIRTY.clear(); DEV.mode='cloud'; DEV.lastTs = 0; saveDev(); recompute(); persistLocal(); }
+      Sync.listen(); Sync.push(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — syncing');
+    }catch(e){ busy(btn,false); err.textContent = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : fbError(e); }
+  },
+  copyCode: async ()=>{ const t = setupCode(); try{ await navigator.clipboard.writeText(t); toast('Setup code copied'); }catch(e){ const el=document.getElementById('scode'); el.focus(); el.select(); toast('Long-press the code and choose Copy'); } },
+  syncStop: ()=>confirmSheet('Stop syncing on this phone? It keeps its current copy of the data. You can join again later with the setup code and passphrase.','Stop syncing', async ()=>{ await Sync.stop(); UI.syncStep=null; render(); toast('Sync stopped on this phone'); })
+};
 
 /* ================= Event binding ================= */
 function bindView(){
@@ -1046,13 +1388,14 @@ function bindView(){
   on('[data-mv]', b=>{ UI.moneyView=b.dataset.mv; UI.openMonth=null; UI.keepScroll=true; render(); });
   on('[data-month]', b=>{ UI.openMonth = b.dataset.open==='1' ? '__none__' : b.dataset.month; UI.keepScroll=true; render(); });
   on('[data-alert]', b=>UI._alerts[+b.dataset.alert].go());
-  on('[data-act]', b=>ACT[b.dataset.act](b.dataset.id, b));
+  on('[data-act]', b=>(ACT[b.dataset.act]||SYNC_ACT[b.dataset.act])(b.dataset.id, b));
+  on('[data-sstep]', b=>{ UI.syncStep=b.dataset.sstep; render(); });
   const ys = document.getElementById('yearSel'); if(ys) ys.onchange=()=>{UI.spendYear=+ys.value; UI.openMonth=null; render();};
   const hc = document.getElementById('homeChart'); if(hc) lineChart(hc, seriesFor(UI.chartBucket, UI.range));
   const bc = document.getElementById('bucketChart'); if(bc) lineChart(bc, seriesFor(UI.bucket, UI.range), {h:160});
   const gc = document.getElementById('goalChart'); if(gc) lineChart(gc, [{name:'Projected balance', color:'var(--accent)', pts:UI._goalPts}], {h:150, yearly:true, label:'Projected goal balance'});
   const f = document.getElementById('importFile'); if(f) f.onchange = importFile;
-  on('[data-lang]', b=>{ S.settings.guideLang=b.dataset.lang; try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){} UI.keepScroll=true; render(); });
+  on('[data-lang]', b=>{ DEV.guideLang=b.dataset.lang; saveDev(); UI.keepScroll=true; render(); });
   app.querySelectorAll('details[data-gi]').forEach(d=>d.addEventListener('toggle',()=>{ if(d.open){ UI.guideOpen=+d.dataset.gi; app.querySelectorAll('details[data-gi]').forEach(o=>{ if(o!==d) o.open=false; }); } }));
 }
 document.getElementById('tabs').onclick = e => { const b=e.target.closest('[data-tab]'); if(!b) return; UI.openMonth=null; go({tab:b.dataset.tab}); };
@@ -1066,11 +1409,12 @@ const ACT = {
   editAssume: ()=>assumeForm(), editHandover: ()=>handoverForm(),
   openAccounts: ()=>go({tab:'more',sub:'accounts'}), openGuide: ()=>go({tab:'more',sub:'guide'}), openInsurance: ()=>go({tab:'more',sub:'insurance'}), openHandover: ()=>go({tab:'more',sub:'handover'}),
   print: ()=>{ try{ window.print(); }catch(e){ toast('Printing is not available here'); } },
-  demo: ()=>{ loadDemo(); go({tab:'home'}); toast('Example data loaded'); },
+  demo: ()=>{ if(DEV.mode==='cloud') return toast('Example data is only for trying the app before sync'); loadDemo(); go({tab:'home'}); toast('Example data loaded'); },
+  openSync: ()=>go({tab:'more',sub:'sync'}),
   export: exportData, import: ()=>document.getElementById('importFile').click(),
-  wipe: ()=>confirmSheet('Clear ALL data on this phone? This cannot be undone. Back up first if unsure.','Clear everything',()=>{ S=blank(); try{localStorage.removeItem(STORE_KEY);}catch(e){} go({tab:'home'}); toast('All data cleared'); }),
+  wipe: ()=>confirmSheet(DEV.mode==='cloud' ? 'Clear ALL data on BOTH phones (family sync is on)? This cannot be undone. Back up first.' : 'Clear ALL data on this phone? This cannot be undone. Back up first if unsure.','Clear everything',()=>{ replaceAll(blank()); go({tab:'home'}); toast('All data cleared'); }),
   split: id=>{ const C=num(document.getElementById('contrib').value); const out=document.getElementById('splitOut'); if(C<=0){out.innerHTML='';return;} out.innerHTML = contributionSplit(bkt(id),C).filter(x=>x.amt>0.5).map(x=>`<div class="rec"><span class="dot" style="background:${tColor(x.k)};width:8px;height:8px"></span> Put <b class="num">${B(x.amt)}</b> into ${TYPE_NAME[x.k]}</div>`).join(''); },
-  reviewed: id=>{ const b=bkt(id); const bt=byType(id); b.lastReview=today(); b.baseline={ invested: bucketValue(id)-bt.cash, flows:0, date:today() }; save(); UI.keepScroll=true; render(); toast('Marked as reviewed'); }
+  reviewed: id=>{ const b=bkt(id); const bt=byType(id); b.lastReview=today(); b.baseline={ invested: bucketValue(id)-bt.cash, at:Date.now() }; put('buckets', b); save(); UI.keepScroll=true; render(); toast('Marked as reviewed'); }
 };
 
 /* ================= Sheets ================= */
@@ -1115,9 +1459,9 @@ function editAccount(id){
     <div class="actions">${id?'<button class="danger" id="del">Delete</button>':''}<button class="primary" id="ok">Save</button></div>`, el=>{
     el.querySelector('#ok').onclick=()=>{ const name=val(el,'an'); if(!name) return toast('Give it a name');
       const data={name,institution:val(el,'ai'),kind:val(el,'ak'),nominee:val(el,'anom'),notes:val(el,'anotes')};
-      if(id) Object.assign(a,data); else S.accounts.push({id:uid(),...data});
+      if(id){ Object.assign(a,data); put('accounts', a); } else put('accounts', {id:uid(),...data});
       after(); };
-    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ if(S.holdings.some(h=>h.accountId===id)) return toast('Move or delete its holdings first'); S.accounts=S.accounts.filter(x=>x.id!==id); after(); };
+    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ if(S.holdings.some(h=>h.accountId===id)) return toast('Move or delete its holdings first'); drop('accounts', id); after(); };
   });
 }
 
@@ -1143,10 +1487,10 @@ function editBucket(id){
       const targets={}; ins.forEach(i=>{ const v=num(i.value); if(v>0) targets[i.dataset.t]=v; });
       const s=sum(Object.values(targets)); if(s!==100 && s!==0) return toast(`Target mix adds up to ${s}% — make it 100%`);
       const data={name,purpose:val(el,'bp'),permanent:el.querySelector('#bperm').checked,targets,threshold:num(val(el,'bth'))||5,reviewMonths:num(val(el,'brm'))||6,moveTrigger:num(val(el,'bmt'))||10};
-      if(id){ Object.assign(b,data); after(); }
-      else { const nb={id:uid(),created:today(),...data}; S.buckets.push(nb); S.flowB[nb.id]=0; save(); closeSheet(); go({tab:'buckets',bucket:nb.id}); }
+      if(id){ Object.assign(b,data); put('buckets', b); after(); }
+      else { const nb=put('buckets', {id:uid(),created:today(),flow0:0,...data}); save(); closeSheet(); go({tab:'buckets',bucket:nb.id}); }
     };
-    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ if(holdingsOf(id).length) return toast('Move or delete its holdings first'); confirmSheet(`Delete bucket "${b.name}"?`,'Delete',()=>{ S.buckets=S.buckets.filter(x=>x.id!==id); delete S.flowB[id]; save(); go({tab:'buckets'}); }); };
+    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ if(holdingsOf(id).length) return toast('Move or delete its holdings first'); confirmSheet(`Delete bucket "${b.name}"?`,'Delete',()=>{ drop('buckets', id); save(); go({tab:'buckets'}); }); };
   });
 }
 
@@ -1180,9 +1524,9 @@ function editGoal(id){
       if(kind==='withdrawals' && !rows.length) return toast('Add at least one period with a year and amount');
       if(kind==='target' && !(ng.target.amt && ng.target.year)) return toast('Enter a target amount and year');
       if(ng.contrib.amt && !ng.contrib.until) ng.contrib.until = kind==='target'? ng.target.year : Math.max(...rows.map(r=>r.to||r.from));
-      b.goal = ng; after();
+      b.goal = ng; put('buckets', b); after();
     };
-    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ b.goal=null; after(); };
+    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ b.goal=null; put('buckets', b); after(); };
   });
 }
 
@@ -1204,16 +1548,18 @@ function editHolding(id, bucketId){
       const name=val(el,'hn'); if(!name) return toast('Give it a name');
       const data={name,type:val(el,'ht'),accountId:val(el,'ha'),bucketId:val(el,'hb'),locked:el.querySelector('#hl').checked, ter: val(el,'ht')==='cash'?0:num(val(el,'hter'))};
       if(id){
-        if(data.bucketId!==h.bucketId){ addFlow(h.bucketId,-h.value); addFlow(data.bucketId,h.value); }
-        Object.assign(h,data); if(h.type==='cash') h.cost=h.value;
+        if(data.bucketId!==h.bucketId) put('txns', {date:today(),kind:'move',hid:id,amt:h.value,note:`Moved to ${bkt(data.bucketId)?.name||''}`,f:[{b:h.bucketId,a:-h.value},{b:data.bucketId,a:h.value}]});
+        const wasCash = h.type==='cash'; Object.assign(h,data);
+        if(wasCash!==(h.type==='cash')){ h.base=h.value; h.baseCost=h.value; h.baseAt=Date.now(); }
+        put('holdings', h);
       } else {
         const v=num(val(el,'hv')); const c=val(el,'hc')===''?v:num(val(el,'hc'));
-        const nh={id:uid(),...data,value:v,cost:data.type==='cash'?v:c,updated:today()};
-        S.holdings.push(nh); S.txns.push({id:uid(),date:today(),kind:'open',hid:nh.id,amt:v,note:'Opening balance'}); addFlow(nh.bucketId, v);
+        const nh=put('holdings', {id:uid(),...data,base:v,baseCost:data.type==='cash'?v:c,baseAt:Date.now(),updated:today()});
+        put('txns', {date:today(),kind:'open',hid:nh.id,amt:v,note:'Opening balance',f:[{b:nh.bucketId,a:v}]});
       }
       after();
     };
-    const d=el.querySelector('#del'); if(d) d.onclick=()=>confirmSheet(`Delete holding "${h.name}"? Its history is removed too.`,'Delete',()=>{ addFlow(h.bucketId,-h.value); S.holdings=S.holdings.filter(x=>x.id!==id); S.txns=S.txns.filter(t=>t.hid!==id&&t.hid2!==id); after(); });
+    const d=el.querySelector('#del'); if(d) d.onclick=()=>confirmSheet(`Delete holding "${h.name}"?`,'Delete',()=>{ put('txns', {date:today(),kind:'close',hid:id,amt:h.value,note:`Deleted ${h.name}`,f:[{b:h.bucketId,a:-h.value}]}); drop('holdings', id); after(); });
   });
 }
 
@@ -1257,39 +1603,35 @@ function opForm(id, op){
       const amt=num(val(el,'amt')); if(amt<0 || (amt===0 && op!=='update' && op!=='setbal')) return toast('Enter an amount');
       const date=val(el,'dt')||today(), note=val(el,'nt'), fee=el.querySelector('#fee')?num(val(el,'fee')):0;
       const other = needOther ? hld(val(el,'other')) : null;
-      const reduce = (x,a)=>{ const ratio = x.value>0? Math.min(1,a/x.value):1; x.cost = x.cost*(1-ratio); x.value -= a; if(x.type==='cash') x.cost=x.value; };
-      const add = (x,a,c=a)=>{ x.value += a; x.cost += c; if(x.type==='cash') x.cost=x.value; };
-      if(op==='update'){ S.txns.push({id:uid(),date,kind:'update',hid:id,amt:amt-h.value,note:note||`${B(h.value)} → ${B(amt)}`}); h.value=amt; }
-      else if(op==='setbal'){ S.txns.push({id:uid(),date,kind:'update',hid:id,amt:amt-h.value,note:note||'Balance corrected'}); h.value=amt; h.cost=amt; }
-      else if(op==='deposit'){ add(h,amt); S.txns.push({id:uid(),date,kind:'deposit',hid:id,amt,note}); addFlow(h.bucketId,amt); trackFlow(h,amt); }
-      else if(op==='withdraw'){ if(amt>h.value+0.01) return toast('More than the holding has'); reduce(h,amt); S.txns.push({id:uid(),date,kind:'withdraw',hid:id,amt,note}); addFlow(h.bucketId,-amt); trackFlow(h,-amt); }
+      const ratio = (x,a) => x.value>0 ? Math.min(1,a/x.value) : 1;
+      const costOut = (x,a) => x.type==='cash' ? a : x.cost*ratio(x,a);
+      const mv = (kind, d, f) => put('txns', {date, kind, hid:id, hid2:other?.id, amt, note: note || (fee?`fee ${B(fee,true)}`:''), d, f});
+      const cross = other && other.bucketId!==h.bucketId;
+      if(op==='update'){ put('txns', {date,kind:'update',hid:id,amt:amt-h.value,note:note||`${B(h.value)} → ${B(amt)}`}); h.base=amt; h.baseCost=h.type==='cash'?amt:h.cost; h.baseAt=Date.now(); }
+      else if(op==='setbal'){ put('txns', {date,kind:'update',hid:id,amt:amt-h.value,note:note||'Balance corrected'}); h.base=amt; h.baseCost=amt; h.baseAt=Date.now(); }
+      else if(op==='deposit'){ mv('deposit', [{h:id,v:amt,c:amt}], [{b:h.bucketId,a:amt}]); }
+      else if(op==='withdraw'){ if(amt>h.value+0.01) return toast('More than the holding has'); mv('withdraw', [{h:id,v:-amt,c:-costOut(h,amt)}], [{b:h.bucketId,a:-amt}]); }
       else if(op==='buy'){
         if(other && amt+fee>other.value+0.01) return toast('Not enough cash in that holding');
-        add(h,amt,amt+fee); if(other) reduce(other,amt+fee);
-        if(!other){ addFlow(h.bucketId,amt+fee); trackFlow(h,amt); }
-        else if(other.bucketId!==h.bucketId){ addFlow(h.bucketId,amt+fee); addFlow(other.bucketId,-(amt+fee)); trackFlow(h,amt); }
-        S.txns.push({id:uid(),date,kind:'buy',hid:id,hid2:other?.id,amt,note:note||(fee?`fee ${B(fee,true)}`:'')});
+        const d=[{h:id,v:amt,c:amt+fee}]; if(other) d.push({h:other.id,v:-(amt+fee),c:-(amt+fee)});
+        const f = !other ? [{b:h.bucketId,a:amt+fee}] : cross ? [{b:h.bucketId,a:amt+fee},{b:other.bucketId,a:-(amt+fee)}] : [];
+        mv('buy', d, f);
       }
       else if(op==='sell'){
         if(amt>h.value+0.01) return toast('More than the holding has');
-        reduce(h,amt); if(other) add(other,amt-fee);
-        if(!other){ addFlow(h.bucketId,-amt); trackFlow(h,-amt); }
-        else if(other.bucketId!==h.bucketId){ addFlow(h.bucketId,-amt); addFlow(other.bucketId,amt-fee); trackFlow(h,-amt); }
-        S.txns.push({id:uid(),date,kind:'sell',hid:id,hid2:other?.id,amt,note:note||(fee?`fee ${B(fee,true)}`:'')});
+        const d=[{h:id,v:-amt,c:-costOut(h,amt)}]; if(other) d.push({h:other.id,v:amt-fee,c:amt-fee});
+        const f = !other ? [{b:h.bucketId,a:-amt}] : cross ? [{b:h.bucketId,a:-amt},{b:other.bucketId,a:amt-fee}] : [];
+        mv('sell', d, f);
       }
       else if(op==='transfer'){
         if(!other) return toast('Choose where to'); if(amt>h.value+0.01) return toast('More than the holding has');
-        reduce(h,amt); add(other,amt); S.txns.push({id:uid(),date,kind:'transfer',hid:id,hid2:other.id,amt,note});
-        if(other.bucketId!==h.bucketId){ addFlow(h.bucketId,-amt); addFlow(other.bucketId,amt); trackFlow(other,amt); }
+        mv('transfer', [{h:id,v:-amt,c:-costOut(h,amt)},{h:other.id,v:amt,c:amt}], cross ? [{b:h.bucketId,a:-amt},{b:other.bucketId,a:amt}] : []);
       }
-      h.updated=date; if(other) other.updated=date;
+      h.updated=date; put('holdings', h); if(other){ other.updated=date; put('holdings', other); }
       after(); toast('Saved');
     };
   });
 }
-/* Money moved in/out of a bucket's investments shouldn't count as a "market move" */
-function trackFlow(h, amt){ const b=bkt(h.bucketId); if(b && b.baseline && h.type!=='cash') b.baseline.flows=(b.baseline.flows||0)+amt; }
-
 function bulkUpdate(){
   const groups = S.buckets.map(b=>({b, hs:holdingsOf(b.id)})).filter(g=>g.hs.length);
   if(!groups.length) return toast('No holdings yet');
@@ -1299,7 +1641,7 @@ function bulkUpdate(){
     el.querySelectorAll('[data-bu]').forEach(i=>i.onfocus=()=>i.select());
     el.querySelector('#ok').onclick=()=>{
       let n=0;
-      el.querySelectorAll('[data-bu]').forEach(i=>{ const h=hld(i.dataset.bu); const v=num(i.value); if(Math.abs(v-h.value)>0.004){ S.txns.push({id:uid(),date:today(),kind:'update',hid:h.id,amt:v-h.value,note:`${B(h.value)} → ${B(v)}`}); h.value=v; if(h.type==='cash') h.cost=v; n++; } h.updated=today(); });
+      el.querySelectorAll('[data-bu]').forEach(i=>{ const h=hld(i.dataset.bu); const v=num(i.value); if(Math.abs(v-h.value)>0.004){ put('txns', {date:today(),kind:'update',hid:h.id,amt:v-h.value,note:`${B(h.value)} → ${B(v)}`}); h.base=v; h.baseCost=h.type==='cash'?v:h.cost; h.baseAt=Date.now(); n++; } h.updated=today(); put('holdings', h); });
       after(); toast(n? `${n} value${n>1?'s':''} updated` : 'No changes — marked as checked');
     };
   });
@@ -1308,7 +1650,7 @@ function bulkUpdate(){
 function moneyForm(kind){
   const isExp = kind==='exp'; const cash = cashHoldings();
   const list = isExp ? S.settings.categories : S.settings.sources;
-  const lastH = isExp ? S.settings.lastExpenseHolding : S.settings.lastIncomeHolding;
+  const lastH = isExp ? DEV.lastExpenseHolding : DEV.lastIncomeHolding;
   sheet(isExp?'Record expense':'Record income', `
     <input id="amt" class="big-input" inputmode="decimal" placeholder="฿0">
     <label>${isExp?'Category':'Source'}</label><div class="cat-grid">${list.map((c,i)=>`<button class="chip ${i===0?'on':''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}</div>
@@ -1323,11 +1665,12 @@ function moneyForm(kind){
     el.querySelector('#ok').onclick=()=>{
       const amt=num(amtIn.value); if(amt<=0) return toast('Enter an amount');
       const hid=val(el,'hid')||null, date=val(el,'dt')||today();
-      if(hid){ const h=hld(hid); const d = isExp? -amt : amt; h.value+=d; h.cost=h.value; h.updated=date;
-        if(isExp || cat!==RETURN_SOURCE) addFlow(h.bucketId, d);   // dividends/interest = investment return, not new money
-        if(isExp) S.settings.lastExpenseHolding=hid; else S.settings.lastIncomeHolding=hid; }
-      if(isExp) S.expenses.push({id:uid(),date,amt,cat,hid,note:val(el,'nt')});
-      else S.income.push({id:uid(),date,amt,src:cat,hid,note:val(el,'nt')});
+      let d=[], f=[];
+      if(hid){ const h=hld(hid); const dv = isExp? -amt : amt; d=[{h:hid,v:dv,c:dv}];
+        if(isExp || cat!==RETURN_SOURCE) f=[{b:h.bucketId,a:dv}];   // dividends/interest = investment return, not new money
+        if(isExp) DEV.lastExpenseHolding=hid; else DEV.lastIncomeHolding=hid; saveDev(); }
+      if(isExp) put('expenses', {date,amt,cat,hid,note:val(el,'nt'),d,f});
+      else put('income', {date,amt,src:cat,hid,note:val(el,'nt'),d,f});
       after();
       if(isExp){ const bs=budgetStatus(+date.slice(0,4)); toast(bs.budget? `Saved · ${B(Math.max(0,bs.remaining))} left in ${date.slice(0,4)} budget` : 'Saved'); } else toast('Saved');
     };
@@ -1340,10 +1683,9 @@ function entrySheet(kind, id){
   const e = arr.find(x=>x.id===id); const h=hld(e.hid);
   sheet(`${esc(isExp?e.cat:e.src)} · ${B(e.amt,true)}`, `<div class="faint">${fmtDate(e.date)} · ${esc(h?h.name:'Not a tracked account')}${e.note?' · '+esc(e.note):''}</div>
     <div class="actions"><button class="danger" id="del">Delete</button></div>
-    <div class="faint" style="margin-top:6px">${isExp?'Deleting puts the money back into the account it came from.':'Deleting takes the money back out of the account it went into.'}</div>`, el=>{
+    <div class="faint" style="margin-top:6px">${e.legacy ? 'Recorded before v2 — deleting removes the record only; correct the balance by hand if needed.' : isExp?'Deleting puts the money back into the account it came from.':'Deleting takes the money back out of the account it went into.'}</div>`, el=>{
     el.querySelector('#del').onclick=()=>{
-      if(h){ const d = isExp? e.amt : -e.amt; h.value+=d; h.cost=h.value; if(isExp || e.src!==RETURN_SOURCE) addFlow(h.bucketId, d); }
-      if(isExp) S.expenses=S.expenses.filter(x=>x.id!==id); else S.income=S.income.filter(x=>x.id!==id);
+      drop(isExp?'expenses':'income', id);
       after(); toast('Deleted');
     };
   });
@@ -1361,8 +1703,8 @@ function editPolicy(id){
     <div class="actions">${id?'<button class="danger" id="del">Delete</button>':''}<button class="primary" id="ok">Save</button></div>`, el=>{
     el.querySelector('#ok').onclick=()=>{ const name=val(el,'pn'); if(!name) return toast('Give it a name');
       const data={name,type:val(el,'pt'),insurer:val(el,'pi'),insured:val(el,'pins'),policyNo:val(el,'pno'),cover:num(val(el,'pc'))||'',premium:num(val(el,'pp'))||'',renewal:val(el,'pr'),beneficiary:val(el,'pb'),notes:val(el,'pnotes')};
-      if(id) Object.assign(p,data); else S.policies.push({id:uid(),...data}); after(); };
-    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ S.policies=S.policies.filter(x=>x.id!==id); after(); };
+      if(id){ Object.assign(p,data); put('policies', p); } else put('policies', {id:uid(),...data}); after(); };
+    const d=el.querySelector('#del'); if(d) d.onclick=()=>{ drop('policies', id); after(); };
   });
 }
 function budgetForm(){
@@ -1375,14 +1717,14 @@ function budgetForm(){
     const ba=el.querySelector('#ba'), by=el.querySelector('#by');
     const upd=()=>el.querySelector('#pm').textContent=B(num(ba.value)/12); ba.oninput=upd; upd();
     by.oninput=()=>{ ba.value=S.settings.budgets[by.value]||''; upd(); };
-    el.querySelector('#ok').onclick=()=>{ S.settings.budgets[by.value]=num(ba.value); after(); };
+    el.querySelector('#ok').onclick=()=>{ S.settings.budgets[by.value]=num(ba.value); putSettings(); after(); };
   });
 }
 function listForm(key, title){
   sheet(title, `<label>One per line</label><textarea id="lst" rows="12">${esc(S.settings[key].join('\n'))}</textarea>
     ${key==='sources'?`<div class="faint">Keep "${RETURN_SOURCE}" — income with that name counts as investment return, not new money.</div>`:''}
     <div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{
-    el.querySelector('#ok').onclick=()=>{ const c=val(el,'lst').split('\n').map(s=>s.trim()).filter(Boolean); if(!c.length) return toast('Keep at least one'); S.settings[key]=[...new Set(c)]; after(); };
+    el.querySelector('#ok').onclick=()=>{ const c=val(el,'lst').split('\n').map(s=>s.trim()).filter(Boolean); if(!c.length) return toast('Keep at least one'); S.settings[key]=[...new Set(c)]; putSettings(); after(); };
   });
 }
 function assumeForm(){
@@ -1392,23 +1734,22 @@ function assumeForm(){
     <div><label>Inflation (%)</label><input id="infl" type="number" inputmode="decimal" step="0.1" value="${S.settings.inflation}"></div></div>
     <div class="actions"><button id="reset">Reset</button><button class="primary" id="ok">Save</button></div>`, el=>{
     el.querySelector('#reset').onclick=()=>{ el.querySelectorAll('[data-a]').forEach(i=>i.value=DEFAULT_ASSUME[i.dataset.a]); el.querySelector('#infl').value=2; };
-    el.querySelector('#ok').onclick=()=>{ el.querySelectorAll('[data-a]').forEach(i=>A[i.dataset.a]=num(i.value)); S.settings.inflation=num(val(el,'infl')); after(); };
+    el.querySelector('#ok').onclick=()=>{ el.querySelectorAll('[data-a]').forEach(i=>A[i.dataset.a]=num(i.value)); S.settings.inflation=num(val(el,'infl')); putSettings(); after(); };
   });
 }
 function handoverForm(){
   sheet('Instructions for family', `<p class="help">Who to call first, where the will and documents are kept, how household bills are paid, which accountant or lawyer knows your affairs. <b>No passwords or PINs.</b></p>
     <textarea id="ho" rows="12">${esc(S.settings.handover||'')}</textarea>
     <div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{
-    el.querySelector('#ok').onclick=()=>{ S.settings.handover=val(el,'ho'); after(); };
+    el.querySelector('#ok').onclick=()=>{ S.settings.handover=val(el,'ho'); putSettings(); after(); };
   });
 }
 
 /* ================= Backup ================= */
 async function exportData(){
-  S.settings.lastBackup = today();
+  DEV.lastBackup = today(); saveDev();
   const json = JSON.stringify(S);
   const name = `mywealth-backup-${today()}.json`;
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){}
   const file = new File([json], name, {type:'application/json'});
   try{
     if(navigator.canShare && navigator.canShare({files:[file]})){ await navigator.share({files:[file], title:'My Wealth backup'}); UI.keepScroll=true; render(); toast('Backup shared — save it to Google Drive'); return; }
@@ -1420,9 +1761,20 @@ function importFile(ev){
   const f = ev.target.files[0]; if(!f) return;
   const r = new FileReader();
   r.onload = ()=>{ try{ const d=JSON.parse(r.result); if(!d || !Array.isArray(d.holdings)) throw new Error('Not a My Wealth backup');
-      confirmSheet(`Replace everything on this phone with the backup from ${d.settings?.lastBackup?fmtDate(d.settings.lastBackup):'this file'}?`,'Restore',()=>{ S=migrate(d); save(); go({tab:'home'}); toast('Restored'); });
+      confirmSheet(`Replace everything ${DEV.mode==='cloud'?'on BOTH phones':'on this phone'} with this backup?`,'Restore',()=>{ replaceAll(migrate(d)); go({tab:'home'}); toast('Restored'); });
     }catch(e){ toast('Could not read that file: '+e.message); } };
   r.readAsText(f); ev.target.value='';
+}
+
+/* Replace all data (restore / clear). With sync on, the old records are deleted for both phones. */
+function replaceAll(newS){
+  if(DEV.mode==='cloud'){
+    KINDS.forEach(k=>S[k].forEach(r=>{ if(!newS[k].some(x=>x.id===r.id)) DIRTY.set(r.id,{kind:k,del:true}); }));
+    S = newS; recompute();
+    KINDS.forEach(k=>S[k].forEach(r=>{ r.at=Date.now(); DIRTY.set(r.id,{kind:k,del:false}); }));
+    S.settings.at = Date.now(); DIRTY.set('settings',{kind:'settings',del:false});
+  } else { S = newS; }
+  save();
 }
 
 /* ================= Demo data ================= */
@@ -1452,15 +1804,15 @@ function loadDemo(){
   H({name:'Thai stocks',type:'equity',accountId:st,bucketId:gr.id,value:1200000,cost:1300000});
   H({name:'RMF bond',type:'bond',accountId:ix,bucketId:gr.id,value:1500000,cost:1440000,locked:true,ter:0.5});
   H({name:'Gold fund',type:'gold',accountId:ix,bucketId:gr.id,value:1350000,cost:1100000,ter:0.9});
-  S.settings.lastExpenseHolding = daily.id; S.settings.lastIncomeHolding = daily.id;
-  // flows: what was put in a year ago ≈ 92% of cost, the rest added through the year
-  S.buckets.forEach(b=>S.flowB[b.id]=Math.round(bucketCost(b.id)));
+  DEV.lastExpenseHolding = daily.id; DEV.lastIncomeHolding = daily.id; saveDev();
+  const nowMs = Date.now(); S.holdings.forEach(h=>{ h.base=h.value; h.baseCost=h.cost; h.baseAt=nowMs; h.at=nowMs; });
+  S.buckets.forEach(b=>{ b.flow0=Math.round(bucketCost(b.id)); b.at=nowMs; }); recompute();
   const endT = totalValue(); let walk=1; const pts=[];
   for(let i=365;i>=1;i--){ walk *= 1+(Math.sin(i/23)*0.002)+(Math.random()-0.5)*0.008; pts.push(walk); }
   const norm = pts[pts.length-1];
   pts.forEach((p,i)=>{ const d=new Date(); d.setDate(d.getDate()-(365-i)); const ramp = 0.86+0.14*(i+1)/365;
-    const snap={d:iso(d),t:0,f:0,b:{},fb:{}};
-    S.buckets.forEach(b=>{ const bv=b.id===em.id? bucketValue(b.id)*(0.92+0.08*(i+1)/365) : bucketValue(b.id)*ramp*(p/norm); snap.b[b.id]=Math.round(bv); snap.fb[b.id]=Math.round(S.flowB[b.id]*(0.92+0.08*(i+1)/365)); snap.t+=snap.b[b.id]; snap.f+=snap.fb[b.id]; });
+    const snap={id:'snap-'+iso(d),d:iso(d),t:0,f:0,b:{},fb:{}};
+    S.buckets.forEach(b=>{ const bv=b.id===em.id? bucketValue(b.id)*(0.92+0.08*(i+1)/365) : bucketValue(b.id)*ramp*(p/norm); snap.b[b.id]=Math.round(bv); snap.fb[b.id]=Math.round(b.flow0*(0.92+0.08*(i+1)/365)); snap.t+=snap.b[b.id]; snap.f+=snap.fb[b.id]; });
     S.snaps.push(snap); });
   // a year of income and expenses
   for(let d=new Date(start); d<=new Date(); d.setDate(d.getDate()+1)){
@@ -1474,16 +1826,23 @@ function loadDemo(){
   S.policies.push({id:uid(),name:'Term life — Tong',type:'Life',insurer:'AIA',insured:'Tong',cover:10000000,premium:28000,renewal:iso(new Date(Date.now()+20*864e5)),beneficiary:'Namthip',policyNo:'',notes:''});
   S.policies.push({id:uid(),name:'Family health plan',type:'Health',insurer:'Muang Thai Life',insured:'Whole family',cover:5000000,premium:85000,renewal:iso(new Date(Date.now()+150*864e5)),beneficiary:'',policyNo:'',notes:''});
   S.settings.handover = 'Call first: our accountant (phone in contacts as "Accountant").\nWill and house deeds: in the safe at home.\nInnovestX relationship manager handles the funds.';
-  S.buckets.forEach(b=>{ const bt=byType(b.id); b.lastReview = s0; b.baseline={invested:(bucketValue(b.id)-bt.cash)*0.9,flows:0,date:s0}; });
+  S.buckets.forEach(b=>{ const bt=byType(b.id); b.lastReview = s0; b.baseline={invested:(bucketValue(b.id)-bt.cash)*0.9,at:parseD(s0).getTime()}; });
   save();
 }
 
 /* ================= Boot ================= */
 try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist(); }catch(e){}
 if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(()=>{});
-if(S.holdings.length) save();
 try{ history.replaceState({tab:'home',bucket:null,sub:null},''); }catch(e){}
-render();
+(async ()=>{
+  await loadState();
+  try{ const m = localStorage.getItem('mw.mockfb'); if(m) DEV.mockFb = m; }catch(e){}   // test hook only
+  if(S.holdings.length) save();
+  render();
+  if(DEV.mode==='cloud') Sync.resume();
+})();
+window.addEventListener('online', ()=>{ if(DEV.mode==='cloud'){ if(Sync.state==='offline') Sync.resume(); else Sync.push(); } scheduleRender(); });
+window.addEventListener('offline', scheduleRender);
 window.addEventListener('resize', ()=>{ clearTimeout(window._rt); window._rt=setTimeout(()=>{UI.keepScroll=true;render();},200); });
 </script>
 </body>
