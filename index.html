@@ -847,7 +847,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.0.3 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.0.4 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -1255,6 +1255,29 @@ const Sync = {
   async stop(){ try{ if(this.unsub) this.unsub(); if(this.auth) await this.F.signOut(this.auth); }catch(e){} this.unsub=null; this.user=null; this.key=null; this.state='off';
     await IDB.del('vaultKey'); DIRTY.clear(); DEV.mode='local'; DEV.lastTs=0; saveDev(); persistLocal(); }
 };
+/* Ask Firestore directly (REST) — gives a clear reason when the library just says "offline" */
+async function probeDb(){
+  const pid = DEV.cfg?.projectId || '?';
+  let token = '';
+  try{ if(Sync.user && Sync.user.getIdToken) token = await Sync.user.getIdToken(); }catch(e){}
+  let status = 0, body = '';
+  try{
+    const r = await fetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(pid)}/databases/(default)/documents/meta/vault`, { headers: token ? {Authorization:'Bearer '+token} : {} });
+    status = r.status; const j = await r.json().catch(()=>({})); body = j.error ? `${j.error.status||''}: ${j.error.message||''}` : 'OK';
+  }catch(e){ body = String(e && e.message || e); }
+  let verdict;
+  if(status===200) verdict = 'The database is reachable and your family vault exists. The connection itself is the problem — send me this result.';
+  else if(status===404 && /does not exist|database/i.test(body) && !/document/i.test(body)) verdict = `No database called "(default)" exists in project "${pid}". In Firebase → Build → Firestore Database, create a database and leave the Database ID as (default), Standard edition.`;
+  else if(status===404) verdict = 'The database is reachable (no family vault yet — that\'s normal for the first phone). The connection itself is the problem — send me this result.';
+  else if(status===403 && /has not been used|disabled|SERVICE_DISABLED/i.test(body)) verdict = 'The Cloud Firestore API is switched off for this project. Open Firestore Database in Firebase once more, or enable "Cloud Firestore API" in Google Cloud.';
+  else if(status===403) verdict = 'The database refused access. Check that your User UID is in the Firestore rules exactly, and tap Publish.';
+  else if(status===400 && /database/i.test(body)) verdict = `Problem with the database in project "${pid}": it may not be a Standard-edition database called "(default)".`;
+  else if(status===401) verdict = 'Sign-in token was refused. Sign out and sign in again.';
+  else if(status===0) verdict = 'The phone couldn\'t reach firestore.googleapis.com at all. Check for an ad-blocker, VPN or "Private DNS" setting that blocks Google services, or try on another Wi-Fi / mobile data.';
+  else verdict = 'Unexpected answer — send me this result.';
+  return { status, body: body.slice(0,240), verdict, pid };
+}
+function probeHTML(p){ return `<div class="rec" style="margin-top:10px"><b>Connection test:</b> ${esc(p.verdict)}<div class="faint" style="margin-top:6px;word-break:break-word">Result for support: HTTP ${p.status} · ${esc(p.body)} · project ${esc(p.pid)}</div></div>`; }
 function stripRec(kind, r){ if(kind!=='holdings') return r; const {value, cost, ...rest} = r; return rest; }
 function applyRemote(id, o){
   const kind = o.k;
@@ -1351,7 +1374,8 @@ const SYNC_ACT = {
     const email = document.getElementById('siEmail').value, pw = document.getElementById('siPass').value, err = document.getElementById('siErr');
     if(!email || !pw) return err.textContent = 'Enter email and password.';
     busy(btn, true, 'Signing in…'); err.textContent='';
-    const show = (e, stage) => { busy(btn,false); console.warn(e); err.innerHTML = esc(fbError(e, stage)) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; };
+    const show = async (e, stage) => { busy(btn,false); console.warn(e); err.innerHTML = esc(fbError(e, stage)) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`;
+      if(stage==='db'){ err.insertAdjacentHTML('beforeend', '<div class="faint" style="margin-top:8px">Running a connection test…</div>'); const p = await probeDb(); err.lastElementChild.remove(); err.insertAdjacentHTML('beforeend', probeHTML(p)); } };
     try{ await Sync.signIn(email, pw); }catch(e){ return show(e, 'auth'); }
     try{
       if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); Sync.push(); } else Sync.state='locked'; render(); return; }
