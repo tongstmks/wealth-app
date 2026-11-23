@@ -847,7 +847,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.0.1 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.0.2 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -1142,11 +1142,21 @@ function parseCfg(text){
   return (o.apiKey && o.projectId) ? o : null;
 }
 const setupCode = () => DEV.cfg ? 'MW1.' + btoa(unescape(encodeURIComponent(JSON.stringify({apiKey:DEV.cfg.apiKey, authDomain:DEV.cfg.authDomain, projectId:DEV.cfg.projectId, appId:DEV.cfg.appId})))) : '';
-function fbError(e){
+function fbDetail(e){ return esc(((e && e.code) ? e.code+' — ' : '') + (e && e.message || String(e))).slice(0,300); }
+function fbError(e, stage){
   const c = (e && (e.code||'')) + ' ' + (e && e.message || e);
+  if(stage==='db'){
+    if(/permission-denied|insufficient permissions/i.test(c)) return 'Signed in, but the database refused access. Check that this person\'s User UID is in the Firestore rules (Part D), then tap Publish.';
+    if(/not-found|does not exist|NOT_FOUND/i.test(c)) return 'Signed in, but no database was found. In Firebase, open Build → Firestore Database and create it (Part D), with database ID "(default)" and Standard edition.';
+    if(/offline|unavailable|deadline|timeout/i.test(c)) return 'Signed in, but the app couldn\'t reach the database. Check: (1) Firestore Database is created (Part D) in Standard edition with database ID "(default)"; (2) the rules are published.';
+  }
+  if(/network-request-failed/.test(c)) return 'Couldn\'t reach Firebase sign-in. Check the internet, and that Email/Password is enabled in Firebase → Authentication → Sign-in method.';
+  if(/operation-not-allowed/.test(c)) return 'Email/Password sign-in isn\'t enabled. Firebase → Authentication → Sign-in method → Email/Password → Enable → Save.';
+  if(/requests-from-referer|referer/i.test(c)) return 'Your Firebase API key is restricted to other websites. In Google Cloud → Credentials, allow your github.io address or remove the restriction.';
   if(/invalid-credential|wrong-password|user-not-found|invalid-email|invalid-login/.test(c)) return 'Email or password is wrong. Check the user you added in Firebase → Authentication.';
   if(/permission-denied|insufficient permissions/i.test(c)) return 'Firebase refused access. Check that this person\'s User UID is in the Firestore rules, then tap Publish.';
-  if(/network|unavailable|offline|Failed to fetch|importing a module/i.test(c)) return 'No connection to Firebase. Check your internet and try again.';
+  if(/importing a module|Failed to fetch dynamically/i.test(c)) return 'Couldn\'t download the Firebase library. Check the internet and try again.';
+  if(/network|unavailable|offline|Failed to fetch/i.test(c)) return 'No connection to Firebase. Check your internet and try again.';
   if(/api-key|API key/i.test(c)) return 'The setup code / Firebase settings look wrong. Paste them again.';
   if(/too-many-requests/.test(c)) return 'Too many attempts. Wait a few minutes and try again.';
   return 'Something went wrong: ' + (e && e.message || e);
@@ -1208,11 +1218,12 @@ const Sync = {
     } catch(e){ console.warn(e); }
     this.pushing = false;
   },
+  lastErr:null,
   listen(){
     const F=this.F; if(this.unsub) this.unsub();
     const since = Math.max(0, (DEV.lastTs||0) - 120000);
     const q = F.query(F.collection(this.db,'items'), F.where('ts','>', F.Timestamp.fromMillis(since)));
-    this.unsub = F.onSnapshot(q, snap=>this.onSnap(snap), e=>{ this.state='error'; this.err=fbError(e); scheduleRender(); });
+    this.unsub = F.onSnapshot(q, snap=>this.onSnap(snap), e=>{ this.state='error'; this.err=fbError(e,'db'); this.lastErr=e; scheduleRender(); });
     this.state = 'on'; this.err='';
   },
   async onSnap(snap){
@@ -1338,12 +1349,14 @@ const SYNC_ACT = {
     const email = document.getElementById('siEmail').value, pw = document.getElementById('siPass').value, err = document.getElementById('siErr');
     if(!email || !pw) return err.textContent = 'Enter email and password.';
     busy(btn, true, 'Signing in…'); err.textContent='';
+    const show = (e, stage) => { busy(btn,false); console.warn(e); err.innerHTML = esc(fbError(e, stage)) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; };
+    try{ await Sync.signIn(email, pw); }catch(e){ return show(e, 'auth'); }
     try{
-      await Sync.signIn(email, pw);
       if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); Sync.push(); } else Sync.state='locked'; render(); return; }
+      btn.textContent = 'Checking family vault…';
       const meta = await Sync.vault();
       UI.syncStep = meta ? 'unlock' : 'create'; UI.vaultMeta = meta; render();
-    }catch(e){ busy(btn,false); err.textContent = fbError(e); }
+    }catch(e){ show(e, 'db'); }
   },
   syncCreate: async (_, btn)=>{
     const p1 = document.getElementById('pp1').value, p2 = document.getElementById('pp2').value, err = document.getElementById('ppErr');
@@ -1357,7 +1370,7 @@ const SYNC_ACT = {
       DEV.mode = 'cloud'; DEV.lastTs = 0; saveDev();
       Sync.markAll(); persistLocal(); await Sync.push(); Sync.listen();
       UI.syncStep = null; render(); toast('Family sync is on');
-    }catch(e){ busy(btn,false); err.textContent = fbError(e); }
+    }catch(e){ busy(btn,false); err.innerHTML = esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
   },
   syncUnlock: async (_, btn)=>{
     const p1 = document.getElementById('pp1').value, err = document.getElementById('ppErr');
@@ -1367,7 +1380,7 @@ const SYNC_ACT = {
       await Sync.unlock(p1, meta);
       if(DEV.mode!=='cloud'){ S = blank(); S.settings.at = 0; DIRTY.clear(); DEV.mode='cloud'; DEV.lastTs = 0; saveDev(); recompute(); persistLocal(); }
       Sync.listen(); Sync.push(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — syncing');
-    }catch(e){ busy(btn,false); err.textContent = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : fbError(e); }
+    }catch(e){ busy(btn,false); err.innerHTML = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
   },
   copyCode: async ()=>{ const t = setupCode(); try{ await navigator.clipboard.writeText(t); toast('Setup code copied'); }catch(e){ const el=document.getElementById('scode'); el.focus(); el.select(); toast('Long-press the code and choose Copy'); } },
   syncStop: ()=>confirmSheet('Stop syncing on this phone? It keeps its current copy of the data. You can join again later with the setup code and passphrase.','Stop syncing', async ()=>{ await Sync.stop(); UI.syncStep=null; render(); toast('Sync stopped on this phone'); })
