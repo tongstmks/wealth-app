@@ -137,12 +137,10 @@ th{color:var(--text-3);font-weight:500;border-top:0}
 .guide .gbody ul,.guide .gbody ol{padding-left:20px;margin:6px 0}
 .guide .gbody li{margin:4px 0}
 .helpbtn{width:36px;height:36px;min-height:36px;border-radius:50%;padding:0;font-weight:700;color:var(--accent);border-color:var(--line)}
-.print-only{display:none}
 @media print{
   body{padding:0;background:#fff;color:#000}
   nav.tabs,.fab,.no-print,.toast{display:none!important}
   .card{border:1px solid #bbb;break-inside:avoid}
-  .print-only{display:block}
   main{max-width:none}
 }
 </style>
@@ -194,6 +192,7 @@ async function loadState(){
   try{ await IDB.open(); d = await IDB.get('state'); dev = await IDB.get('dev'); outbox = await IDB.get('outbox'); }catch(e){ console.warn('IndexedDB unavailable', e); }
   if(!d){ try{ const raw = localStorage.getItem(STORE_KEY); if(raw) d = JSON.parse(raw); if(!dev){ const rd = localStorage.getItem(STORE_KEY+'.dev'); if(rd) dev = JSON.parse(rd); } }catch(e){} }
   DEV = Object.assign({ mode:'local', guideLang:'en' }, dev||{});
+  ['lastTs','mockFb','mockRest'].forEach(k=>delete DEV[k]);   // leftovers from earlier versions
   if(d && d.settings) DEVICE_KEYS.forEach(k=>{ if(d.settings[k]!=null && DEV[k]==null) DEV[k]=d.settings[k]; });
   S = migrate(d);
   if(Array.isArray(outbox)) outbox.forEach(([id,kind,del])=>DIRTY.set(id,{kind,del}));
@@ -847,7 +846,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.1 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.2 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -968,6 +967,21 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>Back up:</b> <b>More → Back up now</b> → choose <b>Drive</b> (Google Drive) and save. Do it every week or two. The app reminds you after 14 days.</p>
   <p><b>Restore / new phone:</b> install the app on the new phone (open your link in Chrome → ⋮ → Install), then <b>More → Restore</b> and pick your latest backup file.</p>
   <p class="faint">Restoring replaces everything on that phone with the backup.</p>`},
+ {i:'📱', t:'Setting up on a new phone', b:`
+  <p><b>Your app's address:</b></p>
+  <div class="rec" style="word-break:break-all"><b>{{URL}}</b></div>
+  <button class="small" data-act="copyUrl">Copy address</button>
+  <p class="faint">Save this address somewhere safe (e.g. in your notes or with the family passphrase).</p>
+  <h3>1. Install the app</h3>
+  <ol><li>On the new Android phone, open <b>Chrome</b> and go to the address above.</li>
+   <li>Tap <b>⋮</b> (top right) → <b>Add to Home screen</b> or <b>Install and create shortcut</b> → choose <b>Install</b>.</li>
+   <li>Open <b>My Wealth</b> from the home screen or app drawer.</li></ol>
+  <h3>2. Get your data onto it — choose one</h3>
+  <ul>
+   <li><b>With family sync (recommended):</b> on the welcome screen tap <b>☁ Join family sync instead</b> (or More → Family sync → Join) → paste the <b>setup code</b> → sign in with that person's email and app password → enter the <b>family passphrase</b>. The data downloads in a few seconds.<br><span class="faint">Setup code: on any phone that already syncs, More → Family sync → Copy setup code.</span></li>
+   <li><b>From a backup file:</b> More → <b>Restore</b> → pick your latest backup file (e.g. from Google Drive).</li>
+  </ul>
+  <p class="faint">No other phone left? You can still join: the setup code is just the Firebase settings — see "Behind the scenes" to find them again.</p>`},
  {i:'☁️', t:'Family sync — sharing with a second phone', b:`
   <p>With family sync on, you and your wife share the same data live. Either phone can add expenses, record income or update values, and the other phone sees it within seconds.</p>
   <ul>
@@ -979,6 +993,18 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>Joining on a new phone:</b> install the app → <b>More → Family sync → Join</b> → paste the setup code (from the first phone: More → Family sync → Copy setup code) → sign in → enter the family passphrase.</p>
   <p>The <b>☁ Synced</b> badge at the top of Home shows the status. Tap it for details.</p>
   <p class="rec">⚠️ If both of you forget the passphrase, the cloud data can't be recovered. Keep it written down, and keep making backup files now and then.</p>`},
+ {i:'🔧', t:'Behind the scenes — GitHub & Firebase', b:`
+  <p>Two free services run the app. You only need these if something must be changed or fixed.</p>
+  <h3>GitHub — where the app lives</h3>
+  <ul><li>The app's files (<code>index.html</code>, <code>sw.js</code>, <code>manifest.json</code>, two icons) are in your GitHub repository, published with <b>GitHub Pages</b> at the address above. No money data is stored there.</li>
+   <li><b>To update the app:</b> github.com → your repository → <b>Add file → Upload files</b> → drop in the new files → <b>Commit changes</b>. Wait 1–2 minutes, then fully close and reopen the app. Check the version at the bottom of More.</li></ul>
+  <h3>Firebase — where synced data lives (encrypted)</h3>
+  <ul><li>Go to <b>console.firebase.google.com</b> and sign in with the Google account that created it. Project: <b>{{PROJECT}}</b>.</li>
+   <li><b>Sign-ins:</b> Build → Authentication → Users. Add a user, copy a <b>User UID</b>, or reset a forgotten app password (⋮ → Reset password).</li>
+   <li><b>Who may access the data:</b> Build → Firestore Database → Rules. Only the User UIDs listed there can get in. If you add a person, add their UID and tap <b>Publish</b>.</li>
+   <li><b>Settings for the setup code:</b> ⚙️ Project settings → General → Your apps → Config (the <code>firebaseConfig</code> block). Paste it into More → Family sync → Set up / Join.</li>
+   <li><b>Cost:</b> the free "Spark" plan. Never click Upgrade / Blaze, and you can't be charged.</li></ul>
+  <p class="faint">The family passphrase is never stored in Firebase. If it's forgotten by everyone, the synced data can't be decrypted — restore from a backup file instead.</p>`},
  {i:'📚', t:'Words used in the app', b:`
   <ul>
    <li><b>Target mix</b> — how you want a bucket split between cash, bonds, equity, etc.</li>
@@ -1078,6 +1104,21 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>สำรอง:</b> <b>More → Back up now</b> → เลือก <b>Drive</b> (Google Drive) แล้วบันทึก ทำทุก 1–2 สัปดาห์ แอปจะเตือนเมื่อครบ 14 วัน</p>
   <p><b>กู้คืน / เครื่องใหม่:</b> ติดตั้งแอปในเครื่องใหม่ (เปิดลิงก์ใน Chrome → ⋮ → Install) แล้วไปที่ <b>More → Restore</b> เลือกไฟล์สำรองล่าสุด</p>
   <p class="faint">การกู้คืนจะแทนที่ข้อมูลทั้งหมดในเครื่องนั้นด้วยข้อมูลจากไฟล์สำรอง</p>`},
+ {i:'📱', t:'ติดตั้งในโทรศัพท์เครื่องใหม่', b:`
+  <p><b>ที่อยู่ของแอป:</b></p>
+  <div class="rec" style="word-break:break-all"><b>{{URL}}</b></div>
+  <button class="small" data-act="copyUrl">คัดลอกที่อยู่</button>
+  <p class="faint">เก็บที่อยู่นี้ไว้ในที่ปลอดภัย (เช่น ในโน้ต หรือเก็บไว้กับรหัสผ่านครอบครัว)</p>
+  <h3>1. ติดตั้งแอป</h3>
+  <ol><li>ในโทรศัพท์ Android เครื่องใหม่ เปิด <b>Chrome</b> แล้วไปที่ที่อยู่ด้านบน</li>
+   <li>แตะ <b>⋮</b> (มุมขวาบน) → <b>Add to Home screen</b> หรือ <b>Install and create shortcut</b> → เลือก <b>Install</b></li>
+   <li>เปิด <b>My Wealth</b> จากหน้าจอหลักหรือหน้ารวมแอป</li></ol>
+  <h3>2. นำข้อมูลเข้าเครื่อง — เลือกอย่างใดอย่างหนึ่ง</h3>
+  <ul>
+   <li><b>ใช้ซิงค์ครอบครัว (แนะนำ):</b> ที่หน้าต้อนรับ แตะ <b>☁ Join family sync instead</b> (หรือ More → Family sync → Join) → วาง <b>setup code</b> → ลงชื่อเข้าใช้ด้วยอีเมลและรหัสผ่านของแอป → ใส่ <b>รหัสผ่านครอบครัว</b> ข้อมูลจะดาวน์โหลดภายในไม่กี่วินาที<br><span class="faint">Setup code: ในเครื่องที่ซิงค์อยู่แล้ว ไปที่ More → Family sync → Copy setup code</span></li>
+   <li><b>จากไฟล์สำรอง:</b> More → <b>Restore</b> → เลือกไฟล์สำรองล่าสุด (เช่น จาก Google Drive)</li>
+  </ul>
+  <p class="faint">ไม่มีเครื่องอื่นเหลือเลย? ยังเข้าร่วมได้ เพราะ setup code คือค่าตั้งค่า Firebase — ดูหัวข้อ "เบื้องหลัง" เพื่อหาใหม่</p>`},
  {i:'☁️', t:'ซิงค์ข้อมูลครอบครัว — ใช้ร่วมกับโทรศัพท์อีกเครื่อง', b:`
   <p>เมื่อเปิดซิงค์ครอบครัว เราและภรรยาจะเห็นข้อมูลชุดเดียวกันแบบเรียลไทม์ ใครบันทึกรายจ่าย รายได้ หรืออัปเดตมูลค่า อีกเครื่องจะเห็นภายในไม่กี่วินาที</p>
   <ul>
@@ -1089,6 +1130,18 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>เพิ่มโทรศัพท์เครื่องใหม่:</b> ติดตั้งแอป → <b>More → Family sync → Join</b> → วาง setup code (จากเครื่องแรก: More → Family sync → Copy setup code) → ลงชื่อเข้าใช้ → ใส่รหัสผ่านครอบครัว</p>
   <p>ป้าย <b>☁ Synced</b> ที่ด้านบนหน้า Home แสดงสถานะ แตะเพื่อดูรายละเอียด</p>
   <p class="rec">⚠️ ถ้าลืมรหัสผ่านครอบครัวทั้งสองคน ข้อมูลบนคลาวด์จะกู้คืนไม่ได้ จดไว้ให้ดี และสำรองข้อมูลเป็นไฟล์เป็นระยะ</p>`},
+ {i:'🔧', t:'เบื้องหลัง — GitHub และ Firebase', b:`
+  <p>แอปทำงานด้วยบริการฟรีสองอย่าง ต้องใช้เฉพาะเมื่อจะแก้ไขหรืออัปเดต</p>
+  <h3>GitHub — ที่เก็บตัวแอป</h3>
+  <ul><li>ไฟล์ของแอป (<code>index.html</code>, <code>sw.js</code>, <code>manifest.json</code> และไอคอนสองไฟล์) อยู่ใน repository ของเราบน GitHub เผยแพร่ด้วย <b>GitHub Pages</b> ที่ที่อยู่ด้านบน ไม่มีข้อมูลการเงินเก็บไว้ที่นั่น</li>
+   <li><b>อัปเดตแอป:</b> github.com → repository ของเรา → <b>Add file → Upload files</b> → ใส่ไฟล์ใหม่ → <b>Commit changes</b> รอ 1–2 นาที แล้วปิดแอปให้สนิทและเปิดใหม่ ดูเลขเวอร์ชันที่ด้านล่างของหน้า More</li></ul>
+  <h3>Firebase — ที่เก็บข้อมูลซิงค์ (เข้ารหัสแล้ว)</h3>
+  <ul><li>ไปที่ <b>console.firebase.google.com</b> ลงชื่อเข้าใช้ด้วยบัญชี Google ที่สร้างไว้ โปรเจกต์: <b>{{PROJECT}}</b></li>
+   <li><b>บัญชีผู้ใช้:</b> Build → Authentication → Users เพิ่มผู้ใช้ คัดลอก <b>User UID</b> หรือรีเซ็ตรหัสผ่านแอปที่ลืม (⋮ → Reset password)</li>
+   <li><b>ใครเข้าถึงข้อมูลได้:</b> Build → Firestore Database → Rules เฉพาะ User UID ที่อยู่ในนั้นเท่านั้นที่เข้าได้ ถ้าเพิ่มคน ให้ใส่ UID แล้วกด <b>Publish</b></li>
+   <li><b>ค่าตั้งค่าสำหรับ setup code:</b> ⚙️ Project settings → General → Your apps → Config (บล็อก <code>firebaseConfig</code>) วางใน More → Family sync → Set up / Join</li>
+   <li><b>ค่าใช้จ่าย:</b> แพ็กเกจฟรี "Spark" ห้ามกด Upgrade / Blaze แล้วจะไม่มีทางถูกเรียกเก็บเงิน</li></ul>
+  <p class="faint">รหัสผ่านครอบครัวไม่ได้เก็บไว้ใน Firebase ถ้าทุกคนลืม ข้อมูลที่ซิงค์จะถอดรหัสไม่ได้ — ให้กู้คืนจากไฟล์สำรองแทน</p>`},
  {i:'📚', t:'คำศัพท์ในแอป', b:`
   <ul>
    <li><b>Target mix</b> — สัดส่วนที่ต้องการในกระเป๋า ระหว่างเงินสด ตราสารหนี้ หุ้น ฯลฯ</li>
@@ -1108,16 +1161,17 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>นี่คือคำแนะนำทางการเงินไหม?</b> ไม่ใช่ แอปแค่คำนวณจากตัวเลขและสมมติฐานของเราเอง ตัวเลขคาดการณ์เป็นการประมาณ ไม่ใช่การรับประกัน</p>`}
 ]}
 };
+const appUrl = () => location.origin + location.pathname.replace(/index\.html$/, '');
 function viewGuide(){
   const lang = DEV.guideLang || 'en'; const G = GUIDE[lang];
   return `${backBtn('Back',{tab:'more'})}
   <div class="row between"><h1 style="margin-top:0">📖 ${G.title}</h1></div>
   <div class="segctl"><button class="${lang==='en'?'on':''}" data-lang="en">English</button><button class="${lang==='th'?'on':''}" data-lang="th">ภาษาไทย</button></div>
   <p class="help">${G.intro}</p>
-  <div class="card guide">${G.sections.map((s,i)=>`<details ${UI.guideOpen===i?'open':''} data-gi="${i}"><summary><span class="gico">${s.i}</span><span style="flex:1">${s.t}</span><span class="chev">›</span></summary><div class="gbody">${s.b}</div></details>`).join('')}</div>`;
+  <div class="card guide">${G.sections.map((s,i)=>`<details ${UI.guideOpen===i?'open':''} data-gi="${i}"><summary><span class="gico">${s.i}</span><span style="flex:1">${s.t}</span><span class="chev">›</span></summary><div class="gbody">${s.b.replaceAll('{{URL}}', esc(appUrl())).replaceAll('{{PROJECT}}', esc(DEV.cfg?.projectId || 'see ⚙️ Project settings'))}</div></details>`).join('')}</div>`;
 }
 
-/* ================= Family sync (Firebase) + passphrase encryption ================= */
+/* ================= Family sync (Firebase Auth + Firestore REST) + passphrase encryption ================= */
 const FB_VER = '13.4.0';
 const b64 = u8 => { let s=''; for(let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null, u8.subarray(i,i+0x8000)); return btoa(s); };
 const unb64 = t => Uint8Array.from(atob(t), c=>c.charCodeAt(0));
@@ -1145,24 +1199,20 @@ const setupCode = () => DEV.cfg ? 'MW1.' + btoa(unescape(encodeURIComponent(JSON
 function fbDetail(e){ return esc(((e && e.code) ? e.code+' — ' : '') + (e && e.message || String(e))).slice(0,300); }
 function fbError(e, stage){
   const c = (e && (e.code||'')) + ' ' + (e && e.message || e);
-  if(stage==='db'){
-    if(/permission-denied|insufficient permissions/i.test(c)) return 'Signed in, but the database refused access. Check that this person\'s User UID is in the Firestore rules (Part D), then tap Publish.';
-    if(/not-found|does not exist|NOT_FOUND/i.test(c)) return 'Signed in, but no database was found. In Firebase, open Build → Firestore Database and create it (Part D), with database ID "(default)" and Standard edition.';
-    if(/offline|unavailable|deadline|timeout/i.test(c)) return 'Signed in, but the app couldn\'t reach the database. Check: (1) Firestore Database is created (Part D) in Standard edition with database ID "(default)"; (2) the rules are published.';
-  }
-  if(/network-request-failed/.test(c)) return 'Couldn\'t reach Firebase sign-in. Check the internet, and that Email/Password is enabled in Firebase → Authentication → Sign-in method.';
+  if(/invalid-credential|wrong-password|user-not-found|invalid-email|invalid-login/.test(c)) return 'Email or password is wrong. Check the user in Firebase → Authentication → Users.';
   if(/operation-not-allowed/.test(c)) return 'Email/Password sign-in isn\'t enabled. Firebase → Authentication → Sign-in method → Email/Password → Enable → Save.';
-  if(/requests-from-referer|referer/i.test(c)) return 'Your Firebase API key is restricted to other websites. In Google Cloud → Credentials, allow your github.io address or remove the restriction.';
-  if(/invalid-credential|wrong-password|user-not-found|invalid-email|invalid-login/.test(c)) return 'Email or password is wrong. Check the user you added in Firebase → Authentication.';
-  if(/permission-denied|insufficient permissions/i.test(c)) return 'Firebase refused access. Check that this person\'s User UID is in the Firestore rules, then tap Publish.';
-  if(/importing a module|Failed to fetch dynamically/i.test(c)) return 'Couldn\'t download the Firebase library. Check the internet and try again.';
-  if(/network|unavailable|offline|Failed to fetch/i.test(c)) return 'No connection to Firebase. Check your internet and try again.';
-  if(/api-key|API key/i.test(c)) return 'The setup code / Firebase settings look wrong. Paste them again.';
   if(/too-many-requests/.test(c)) return 'Too many attempts. Wait a few minutes and try again.';
+  if(/api-key|API key/i.test(c)) return 'The Firebase settings / setup code look wrong. Paste them again.';
+  if(/permission-denied|PERMISSION_DENIED/i.test(c)) return 'The database refused access. Check that this person\'s User UID is in the Firestore rules, then tap Publish.';
+  if(/database.*does not exist|not-found/i.test(c)) return 'No database found. In Firebase → Build → Firestore Database, create one with the ID "(default)", Standard edition.';
+  if(/SERVICE_DISABLED|has not been used/i.test(c)) return 'The Cloud Firestore API is switched off for this project. Open Firestore Database in the Firebase console to turn it on.';
+  if(/unauthenticated/.test(c)) return 'Your sign-in expired. Sign in again.';
+  if(e instanceof TypeError || /network|Failed to fetch|importing a module/i.test(c)) return 'No internet connection to Firebase. Check your connection and try again.';
   return 'Something went wrong: ' + (e && e.message || e);
 }
+const errHTML = (e, stage) => esc(fbError(e, stage)) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details: ${fbDetail(e)}</div>`;
 /* Firestore REST helpers — talks to the database directly over HTTPS (more reliable on phones than the streaming library) */
-const REST = () => (DEV.mockRest || 'https://firestore.googleapis.com/v1/') + `projects/${encodeURIComponent(DEV.cfg.projectId)}/databases/(default)/documents`;
+const REST = () => 'https://firestore.googleapis.com/v1/' + `projects/${encodeURIComponent(DEV.cfg.projectId)}/databases/(default)/documents`;
 function toFS(v){
   if(v===null || v===undefined) return {nullValue:null};
   if(typeof v==='boolean') return {booleanValue:v};
@@ -1185,10 +1235,10 @@ const microsToTs = us => new Date(Math.floor(us/1000)).toISOString().slice(0,19)
 class HttpErr extends Error{ constructor(status, msg){ super(msg); this.status = status; this.code = status===403?'permission-denied':status===404?'not-found':status===401?'unauthenticated':'http-'+status; } }
 
 const Sync = {
-  F:null, app:null, auth:null, user:null, key:null, state:'off', err:'', lastErr:null, pushing:false, again:false, polling:false, timer:null,
+  F:null, app:null, auth:null, user:null, key:null, state:'off', err:'', pushing:false, again:false, polling:false, timer:null,
   async load(){
     if(this.F) return this.F;
-    const base = DEV.mockFb || `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+    const base = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
     const [a,b] = await Promise.all([import(base+'firebase-app.js'), import(base+'firebase-auth.js')]);
     this.F = Object.assign({}, a, b); return this.F;
   },
@@ -1196,7 +1246,6 @@ const Sync = {
   currentUser(){ return new Promise(res=>{ const off = this.F.onAuthStateChanged(this.auth, u=>{ try{ off(); }catch(e){} res(u); }); }); },
   async signIn(email, pw){ const F = await this.init(); const c = await F.signInWithEmailAndPassword(this.auth, email.trim(), pw); this.user = c.user; DEV.email = c.user.email; saveDev(); return c.user; },
   async api(method, path, body){
-    if(globalThis.__mockOffline) throw new TypeError('Failed to fetch (test offline)');
     const token = await this.user.getIdToken();
     const r = await fetch(REST()+path, { method, headers:{ 'Authorization':'Bearer '+token, 'Content-Type':'application/json' }, body: body ? JSON.stringify(body) : undefined });
     const text = await r.text(); let j = {}; try{ j = JSON.parse(text||'{}'); }catch(e){}
@@ -1205,7 +1254,7 @@ const Sync = {
   },
   async vault(){
     try{ const d = await this.api('GET', '/meta/vault'); return fromFS({mapValue:{fields:d.fields||{}}}); }
-    catch(e){ if(e.status===404) return null; throw e; }
+    catch(e){ if(e.status===404 && !/database/i.test(e.message)) return null; throw e; }
   },
   async createVault(pass){
     const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
@@ -1219,9 +1268,9 @@ const Sync = {
     this.key = key; await IDB.set('vaultKey', key);
   },
   markAll(){ KINDS.forEach(k=>S[k].forEach(r=>DIRTY.set(r.id,{kind:k,del:false}))); DIRTY.set('settings',{kind:'settings',del:false}); },
-  ok(){ if(this.state!=='on'){ this.state='on'; this.err=''; this.lastErr=null; scheduleRender(); } },
+  ok(){ if(this.state!=='on'){ this.state='on'; this.err=''; scheduleRender(); } },
   fail(e){
-    console.warn('sync', e); this.lastErr = e;
+    console.warn('sync', e);
     const offline = e instanceof TypeError || navigator.onLine===false;
     this.state = offline ? 'offline' : 'error'; this.err = offline ? 'No internet — changes are saved on this phone and will sync later.' : fbError(e,'db');
     scheduleRender();
@@ -1299,29 +1348,6 @@ const Sync = {
     await IDB.del('vaultKey'); DIRTY.clear(); DEV.mode='local'; DEV.lastTsUs=0; saveDev(); persistLocal();
   }
 };
-/* Ask Firestore directly (REST) — gives a clear reason when the library just says "offline" */
-async function probeDb(){
-  const pid = DEV.cfg?.projectId || '?';
-  let token = '';
-  try{ if(Sync.user && Sync.user.getIdToken) token = await Sync.user.getIdToken(); }catch(e){}
-  let status = 0, body = '';
-  try{
-    const r = await fetch(REST() + '/meta/vault', { headers: token ? {Authorization:'Bearer '+token} : {} });
-    status = r.status; const j = await r.json().catch(()=>({})); body = j.error ? `${j.error.status||''}: ${j.error.message||''}` : 'OK';
-  }catch(e){ body = String(e && e.message || e); }
-  let verdict;
-  if(status===200) verdict = 'The database is reachable and your family vault exists. The connection itself is the problem — send me this result.';
-  else if(status===404 && /does not exist|database/i.test(body) && !/document/i.test(body)) verdict = `No database called "(default)" exists in project "${pid}". In Firebase → Build → Firestore Database, create a database and leave the Database ID as (default), Standard edition.`;
-  else if(status===404) verdict = 'The database is reachable (no family vault yet — that\'s normal for the first phone). The connection itself is the problem — send me this result.';
-  else if(status===403 && /has not been used|disabled|SERVICE_DISABLED/i.test(body)) verdict = 'The Cloud Firestore API is switched off for this project. Open Firestore Database in Firebase once more, or enable "Cloud Firestore API" in Google Cloud.';
-  else if(status===403) verdict = 'The database refused access. Check that your User UID is in the Firestore rules exactly, and tap Publish.';
-  else if(status===400 && /database/i.test(body)) verdict = `Problem with the database in project "${pid}": it may not be a Standard-edition database called "(default)".`;
-  else if(status===401) verdict = 'Sign-in token was refused. Sign out and sign in again.';
-  else if(status===0) verdict = 'The phone couldn\'t reach firestore.googleapis.com at all. Check for an ad-blocker, VPN or "Private DNS" setting that blocks Google services, or try on another Wi-Fi / mobile data.';
-  else verdict = 'Unexpected answer — send me this result.';
-  return { status, body: body.slice(0,240), verdict, pid };
-}
-function probeHTML(p){ return `<div class="rec" style="margin-top:10px"><b>Connection test:</b> ${esc(p.verdict)}<div class="faint" style="margin-top:6px;word-break:break-word">Result for support: HTTP ${p.status} · ${esc(p.body)} · project ${esc(p.pid)}</div></div>`; }
 function stripRec(kind, r){ if(kind!=='holdings') return r; const {value, cost, ...rest} = r; return rest; }
 function applyRemote(id, o){
   const kind = o.k;
@@ -1418,8 +1444,7 @@ const SYNC_ACT = {
     const email = document.getElementById('siEmail').value, pw = document.getElementById('siPass').value, err = document.getElementById('siErr');
     if(!email || !pw) return err.textContent = 'Enter email and password.';
     busy(btn, true, 'Signing in…'); err.textContent='';
-    const show = async (e, stage) => { busy(btn,false); console.warn(e); err.innerHTML = esc(fbError(e, stage)) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`;
-      if(stage==='db'){ err.insertAdjacentHTML('beforeend', '<div class="faint" style="margin-top:8px">Running a connection test…</div>'); const p = await probeDb(); err.lastElementChild.remove(); err.insertAdjacentHTML('beforeend', probeHTML(p)); } };
+    const show = (e, stage) => { busy(btn,false); console.warn(e); err.innerHTML = errHTML(e, stage); };
     try{ await Sync.signIn(email, pw); }catch(e){ return show(e, 'auth'); }
     try{
       if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); } else Sync.state='locked'; render(); return; }
@@ -1440,7 +1465,7 @@ const SYNC_ACT = {
       DEV.mode = 'cloud'; DEV.lastTsUs = 0; saveDev();
       Sync.markAll(); persistLocal(); await Sync.push(); Sync.listen();
       UI.syncStep = null; render(); toast('Family sync is on');
-    }catch(e){ busy(btn,false); err.innerHTML = esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
+    }catch(e){ busy(btn,false); err.innerHTML = errHTML(e,'db'); }
   },
   syncUnlock: async (_, btn)=>{
     const p1 = document.getElementById('pp1').value, err = document.getElementById('ppErr');
@@ -1450,7 +1475,7 @@ const SYNC_ACT = {
       await Sync.unlock(p1, meta);
       if(DEV.mode!=='cloud'){ S = blank(); S.settings.at = 0; DIRTY.clear(); DEV.mode='cloud'; DEV.lastTsUs = 0; saveDev(); recompute(); persistLocal(); }
       Sync.listen(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — downloading family data…');
-    }catch(e){ busy(btn,false); err.innerHTML = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
+    }catch(e){ busy(btn,false); err.innerHTML = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : errHTML(e,'db'); }
   },
   copyCode: async ()=>{ const t = setupCode(); try{ await navigator.clipboard.writeText(t); toast('Setup code copied'); }catch(e){ const el=document.getElementById('scode'); el.focus(); el.select(); toast('Long-press the code and choose Copy'); } },
   syncStop: ()=>confirmSheet('Stop syncing on this phone? It keeps its current copy of the data. You can join again later with the setup code and passphrase.','Stop syncing', async ()=>{ await Sync.stop(); UI.syncStep=null; render(); toast('Sync stopped on this phone'); })
@@ -1493,6 +1518,7 @@ const ACT = {
   setBudget: ()=>budgetForm(), editCats: ()=>listForm('categories','Expense categories'), editSources: ()=>listForm('sources','Income sources'),
   editAssume: ()=>assumeForm(), editHandover: ()=>handoverForm(),
   openAccounts: ()=>go({tab:'more',sub:'accounts'}), openGuide: ()=>go({tab:'more',sub:'guide'}), openInsurance: ()=>go({tab:'more',sub:'insurance'}), openHandover: ()=>go({tab:'more',sub:'handover'}),
+  copyUrl: async ()=>{ try{ await navigator.clipboard.writeText(appUrl()); toast('Address copied'); }catch(e){ toast(appUrl()); } },
   print: ()=>{ try{ window.print(); }catch(e){ toast('Printing is not available here'); } },
   demo: ()=>{ if(DEV.mode==='cloud') return toast('Example data is only for trying the app before sync'); loadDemo(); go({tab:'home'}); toast('Example data loaded'); },
   openSync: ()=>go({tab:'more',sub:'sync'}),
@@ -1921,7 +1947,6 @@ if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigat
 try{ history.replaceState({tab:'home',bucket:null,sub:null},''); }catch(e){}
 (async ()=>{
   await loadState();
-  try{ const m = localStorage.getItem('mw.mockfb'); if(m){ DEV.mockFb = m; DEV.mockRest = m+'v1/'; } }catch(e){}   // test hook only
   if(S.holdings.length) save();
   render();
   if(DEV.mode==='cloud') Sync.resume();
