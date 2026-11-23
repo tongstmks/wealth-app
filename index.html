@@ -847,7 +847,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.0.4 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.1 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -1161,32 +1161,56 @@ function fbError(e, stage){
   if(/too-many-requests/.test(c)) return 'Too many attempts. Wait a few minutes and try again.';
   return 'Something went wrong: ' + (e && e.message || e);
 }
+/* Firestore REST helpers — talks to the database directly over HTTPS (more reliable on phones than the streaming library) */
+const REST = () => (DEV.mockRest || 'https://firestore.googleapis.com/v1/') + `projects/${encodeURIComponent(DEV.cfg.projectId)}/databases/(default)/documents`;
+function toFS(v){
+  if(v===null || v===undefined) return {nullValue:null};
+  if(typeof v==='boolean') return {booleanValue:v};
+  if(typeof v==='number') return Number.isInteger(v) ? {integerValue:String(v)} : {doubleValue:v};
+  if(typeof v==='string') return {stringValue:v};
+  if(Array.isArray(v)) return {arrayValue:{values:v.map(toFS)}};
+  return {mapValue:{fields:Object.fromEntries(Object.entries(v).map(([k,x])=>[k,toFS(x)]))}};
+}
+function fromFS(f){
+  if(!f) return null;
+  if('stringValue' in f) return f.stringValue; if('booleanValue' in f) return f.booleanValue;
+  if('integerValue' in f) return Number(f.integerValue); if('doubleValue' in f) return f.doubleValue;
+  if('timestampValue' in f) return f.timestampValue; if('nullValue' in f) return null;
+  if('arrayValue' in f) return (f.arrayValue.values||[]).map(fromFS);
+  if('mapValue' in f) return Object.fromEntries(Object.entries(f.mapValue.fields||{}).map(([k,x])=>[k,fromFS(x)]));
+  return null;
+}
+const tsMicros = t => { const m = /^(.*?)(?:\.(\d+))?Z$/.exec(t); return m ? Date.parse(m[1]+'Z')*1000 + Number(((m[2]||'')+'000000').slice(0,6)) : 0; };
+const microsToTs = us => new Date(Math.floor(us/1000)).toISOString().slice(0,19) + '.' + String(Math.floor(us%1e6)).padStart(6,'0') + 'Z';
+class HttpErr extends Error{ constructor(status, msg){ super(msg); this.status = status; this.code = status===403?'permission-denied':status===404?'not-found':status===401?'unauthenticated':'http-'+status; } }
+
 const Sync = {
-  F:null, app:null, auth:null, db:null, user:null, key:null, unsub:null, state:'off', err:'', pushing:false, again:false,
+  F:null, app:null, auth:null, user:null, key:null, state:'off', err:'', lastErr:null, pushing:false, again:false, polling:false, timer:null,
   async load(){
     if(this.F) return this.F;
     const base = DEV.mockFb || `https://www.gstatic.com/firebasejs/${FB_VER}/`;
-    const [a,b,c] = await Promise.all([import(base+'firebase-app.js'), import(base+'firebase-auth.js'), import(base+'firebase-firestore.js')]);
-    this.F = Object.assign({}, a, b, c); return this.F;
+    const [a,b] = await Promise.all([import(base+'firebase-app.js'), import(base+'firebase-auth.js')]);
+    this.F = Object.assign({}, a, b); return this.F;
   },
-  async init(){
-    const F = await this.load();
-    if(!this.app){
-      this.app = F.initializeApp(DEV.cfg); this.auth = F.getAuth(this.app);
-      // Long-polling works on networks/phones that block Firestore's streaming connection
-      const base = { experimentalForceLongPolling: true };
-      try{ this.db = F.initializeFirestore(this.app, { ...base, localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) }); }
-      catch(e){ console.warn('persistent cache unavailable', e); this.db = F.initializeFirestore(this.app, base); }
-    }
-    return F;
-  },
+  async init(){ const F = await this.load(); if(!this.app){ this.app = F.initializeApp(DEV.cfg); this.auth = F.getAuth(this.app); } return F; },
   currentUser(){ return new Promise(res=>{ const off = this.F.onAuthStateChanged(this.auth, u=>{ try{ off(); }catch(e){} res(u); }); }); },
   async signIn(email, pw){ const F = await this.init(); const c = await F.signInWithEmailAndPassword(this.auth, email.trim(), pw); this.user = c.user; DEV.email = c.user.email; saveDev(); return c.user; },
-  async vault(){ const F=this.F; const snap = await F.getDoc(F.doc(this.db,'meta','vault')); return snap.exists() ? snap.data() : null; },
+  async api(method, path, body){
+    if(globalThis.__mockOffline) throw new TypeError('Failed to fetch (test offline)');
+    const token = await this.user.getIdToken();
+    const r = await fetch(REST()+path, { method, headers:{ 'Authorization':'Bearer '+token, 'Content-Type':'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    const text = await r.text(); let j = {}; try{ j = JSON.parse(text||'{}'); }catch(e){}
+    if(!r.ok) throw new HttpErr(r.status, (j.error && (j.error.status+': '+j.error.message)) || text.slice(0,200));
+    return j;
+  },
+  async vault(){
+    try{ const d = await this.api('GET', '/meta/vault'); return fromFS({mapValue:{fields:d.fields||{}}}); }
+    catch(e){ if(e.status===404) return null; throw e; }
+  },
   async createVault(pass){
-    const F=this.F; const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
+    const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
     const key = await deriveKey(pass, salt); const check = await encrypt(key, {ok:'mywealth'});
-    await F.setDoc(F.doc(this.db,'meta','vault'), { salt, check, created:Date.now(), v:1 });
+    await this.api('PATCH', '/meta/vault', { fields: toFS({ salt, check, created:Date.now(), v:1 }).mapValue.fields });
     this.key = key; await IDB.set('vaultKey', key);
   },
   async unlock(pass, meta){
@@ -1195,52 +1219,69 @@ const Sync = {
     this.key = key; await IDB.set('vaultKey', key);
   },
   markAll(){ KINDS.forEach(k=>S[k].forEach(r=>DIRTY.set(r.id,{kind:k,del:false}))); DIRTY.set('settings',{kind:'settings',del:false}); },
+  ok(){ if(this.state!=='on'){ this.state='on'; this.err=''; this.lastErr=null; scheduleRender(); } },
+  fail(e){
+    console.warn('sync', e); this.lastErr = e;
+    const offline = e instanceof TypeError || navigator.onLine===false;
+    this.state = offline ? 'offline' : 'error'; this.err = offline ? 'No internet — changes are saved on this phone and will sync later.' : fbError(e,'db');
+    scheduleRender();
+  },
   async push(){
-    if(DEV.mode!=='cloud' || !this.key || !this.db || !this.user) return;
+    if(DEV.mode!=='cloud' || !this.key || !this.user) return;
     if(this.pushing){ this.again = true; return; }
     this.pushing = true;
     try{
       do{
         this.again = false;
         const items = [...DIRTY.entries()]; if(!items.length) break;
-        for(let i=0;i<items.length;i+=400){
-          const chunk = items.slice(i,i+400); const batch = this.F.writeBatch(this.db);
-          for(const [id,{kind,del}] of chunk){
-            const rec = kind==='settings' ? S.settings : S[kind]?.find(x=>x.id===id);
-            const payload = (del || !rec) ? {k:kind, del:true, at:Date.now()} : {k:kind, r:stripRec(kind, rec)};
+        for(let i=0;i<items.length;i+=300){
+          const chunk = items.slice(i,i+300); const writes = [];
+          for(const [id,entry] of chunk){
+            const rec = entry.kind==='settings' ? S.settings : S[entry.kind]?.find(x=>x.id===id);
+            const payload = (entry.del || !rec) ? {k:entry.kind, del:true, at:Date.now()} : {k:entry.kind, r:stripRec(entry.kind, rec)};
             const enc = await encrypt(this.key, payload);
-            batch.set(this.F.doc(this.db,'items',id), { iv:enc.iv, c:enc.c, del:!!payload.del, ts:this.F.serverTimestamp() });
+            writes.push({ update:{ name:`projects/${DEV.cfg.projectId}/databases/(default)/documents/items/${id}`, fields:{ iv:{stringValue:enc.iv}, c:{stringValue:enc.c}, del:{booleanValue:!!payload.del} } },
+                          updateTransforms:[{ fieldPath:'ts', setToServerValue:'REQUEST_TIME' }] });
           }
-          // Firestore keeps these writes safely on the phone and sends them when online
-          batch.commit().catch(e=>{ this.state='error'; this.err=fbError(e); scheduleRender(); });
-          chunk.forEach(([id])=>DIRTY.delete(id));
+          await this.api('POST', ':commit', { writes });
+          chunk.forEach(([id,entry])=>{ if(DIRTY.get(id)===entry) DIRTY.delete(id); });   // keep it if it changed again meanwhile
+          IDB.set('outbox', [...DIRTY.entries()].map(([id,x])=>[id,x.kind,x.del]));
         }
-        IDB.set('outbox', [...DIRTY.entries()].map(([id,x])=>[id,x.kind,x.del]));
+        this.ok();
       } while(this.again);
-    } catch(e){ console.warn(e); }
+    }catch(e){ this.fail(e); }
     this.pushing = false;
   },
-  lastErr:null,
+  async poll(){
+    if(this.polling || DEV.mode!=='cloud' || !this.key || !this.user) return;
+    this.polling = true;
+    try{
+      if(DIRTY.size) await this.push();
+      let since = Math.max(0, (DEV.lastTsUs||0) - 10e6), maxUs = DEV.lastTsUs||0, changed = false;
+      for(let page=0; page<100; page++){
+        const res = await this.api('POST', ':runQuery', { structuredQuery:{ from:[{collectionId:'items'}],
+          where:{ fieldFilter:{ field:{fieldPath:'ts'}, op:'GREATER_THAN', value:{ timestampValue: microsToTs(since) } } },
+          orderBy:[{ field:{fieldPath:'ts'}, direction:'ASCENDING' }], limit:300 } });
+        const docs = (Array.isArray(res) ? res : []).filter(x=>x.document).map(x=>x.document);
+        for(const d of docs){
+          const f = d.fields||{}; const us = f.ts && f.ts.timestampValue ? tsMicros(f.ts.timestampValue) : 0;
+          if(us>maxUs) maxUs = us; if(us>since) since = us;
+          let o; try{ o = await decrypt(this.key, {iv:f.iv?.stringValue, c:f.c?.stringValue}); }catch(e){ console.warn('could not decrypt', d.name); continue; }
+          if(applyRemote(d.name.split('/').pop(), o)) changed = true;
+        }
+        if(docs.length < 300) break;
+      }
+      DEV.lastTsUs = maxUs; saveDev(); this.ok();
+      if(changed){ recompute(); persistLocal(); scheduleRender(); }
+    }catch(e){ this.fail(e); }
+    this.polling = false;
+  },
   listen(){
-    const F=this.F; if(this.unsub) this.unsub();
-    const since = Math.max(0, (DEV.lastTs||0) - 120000);
-    const q = F.query(F.collection(this.db,'items'), F.where('ts','>', F.Timestamp.fromMillis(since)));
-    this.unsub = F.onSnapshot(q, snap=>this.onSnap(snap), e=>{ this.state='error'; this.err=fbError(e,'db'); this.lastErr=e; scheduleRender(); });
-    this.state = 'on'; this.err='';
+    this.stopPoll();
+    const loop = async ()=>{ if(!document.hidden) await this.poll(); this.timer = setTimeout(loop, DIRTY.size ? 2000 : 5000); };
+    loop();
   },
-  async onSnap(snap){
-    const changes = snap.docChanges().filter(c=>c.type!=='removed' && !c.doc.metadata.hasPendingWrites);
-    if(this.state!=='on'){ this.state='on'; this.err=''; scheduleRender(); }
-    if(!changes.length) return;
-    let maxTs = DEV.lastTs||0, changed = false;
-    for(const c of changes){
-      const data = c.doc.data(); if(data.ts && data.ts.toMillis) maxTs = Math.max(maxTs, data.ts.toMillis());
-      let o; try{ o = await decrypt(this.key, data); }catch(e){ console.warn('could not decrypt', c.doc.id); continue; }
-      if(applyRemote(c.doc.id, o)) changed = true;
-    }
-    DEV.lastTs = maxTs; saveDev();
-    if(changed){ recompute(); persistLocal(); scheduleRender(); }
-  },
+  stopPoll(){ clearTimeout(this.timer); this.timer = null; },
   async resume(){
     try{
       await this.init();
@@ -1249,11 +1290,14 @@ const Sync = {
       this.user = u;
       const key = await IDB.get('vaultKey');
       if(!key){ this.state='locked'; scheduleRender(); return; }
-      this.key = key; this.listen(); this.push(); scheduleRender();
-    }catch(e){ this.state='offline'; this.err=fbError(e); scheduleRender(); }
+      this.key = key; this.listen(); scheduleRender();
+    }catch(e){ this.fail(e); }
   },
-  async stop(){ try{ if(this.unsub) this.unsub(); if(this.auth) await this.F.signOut(this.auth); }catch(e){} this.unsub=null; this.user=null; this.key=null; this.state='off';
-    await IDB.del('vaultKey'); DIRTY.clear(); DEV.mode='local'; DEV.lastTs=0; saveDev(); persistLocal(); }
+  async stop(){
+    this.stopPoll(); try{ if(this.auth) await this.F.signOut(this.auth); }catch(e){}
+    this.user=null; this.key=null; this.state='off';
+    await IDB.del('vaultKey'); DIRTY.clear(); DEV.mode='local'; DEV.lastTsUs=0; saveDev(); persistLocal();
+  }
 };
 /* Ask Firestore directly (REST) — gives a clear reason when the library just says "offline" */
 async function probeDb(){
@@ -1262,7 +1306,7 @@ async function probeDb(){
   try{ if(Sync.user && Sync.user.getIdToken) token = await Sync.user.getIdToken(); }catch(e){}
   let status = 0, body = '';
   try{
-    const r = await fetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(pid)}/databases/(default)/documents/meta/vault`, { headers: token ? {Authorization:'Bearer '+token} : {} });
+    const r = await fetch(REST() + '/meta/vault', { headers: token ? {Authorization:'Bearer '+token} : {} });
     status = r.status; const j = await r.json().catch(()=>({})); body = j.error ? `${j.error.status||''}: ${j.error.message||''}` : 'OK';
   }catch(e){ body = String(e && e.message || e); }
   let verdict;
@@ -1309,7 +1353,7 @@ function viewSync(){
     if(Sync.state==='signedout') return head + signInCard('Signed out on this phone. Sign in again to keep syncing.');
     if(Sync.state==='locked') return head + passCard(false, 'Enter the family passphrase to unlock your data on this phone.');
     const ok = Sync.state==='on';
-    return head + `<div class="card"><div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${ok?'var(--good)':Sync.state==='error'?'var(--crit)':'var(--warn)'}">${ok?'✓':'!'}</span><div><b>${ok?'Sync is on':Sync.state==='error'?'Sync problem':'Waiting for connection'}</b><div class="faint">${ok?'Changes on either phone appear on the other within seconds.':esc(Sync.err||'Changes are saved on this phone and will sync when back online.')}</div></div></div>
+    return head + `<div class="card"><div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${ok?'var(--good)':Sync.state==='error'?'var(--crit)':'var(--warn)'}">${ok?'✓':'!'}</span><div><b>${ok?'Sync is on':Sync.state==='error'?'Sync problem':'Waiting for connection'}</b><div class="faint">${ok?'Changes on either phone appear on the other within about 5 seconds while the app is open.':esc(Sync.err||'Changes are saved on this phone and will sync when back online.')}</div></div></div>
       <div class="kv"><span class="k">Signed in as</span><b>${esc(DEV.email||Sync.user?.email||'')}</b></div>
       <div class="kv"><span class="k">Firebase project</span><b>${esc(DEV.cfg?.projectId||'')}</b></div>
       <div class="kv"><span class="k">Encryption</span><b>🔒 Family passphrase</b></div></div>
@@ -1378,7 +1422,7 @@ const SYNC_ACT = {
       if(stage==='db'){ err.insertAdjacentHTML('beforeend', '<div class="faint" style="margin-top:8px">Running a connection test…</div>'); const p = await probeDb(); err.lastElementChild.remove(); err.insertAdjacentHTML('beforeend', probeHTML(p)); } };
     try{ await Sync.signIn(email, pw); }catch(e){ return show(e, 'auth'); }
     try{
-      if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); Sync.push(); } else Sync.state='locked'; render(); return; }
+      if(DEV.mode==='cloud'){ const key = await IDB.get('vaultKey'); if(key){ Sync.key=key; Sync.listen(); } else Sync.state='locked'; render(); return; }
       btn.textContent = 'Checking family vault…';
       const meta = await Sync.vault();
       UI.syncStep = meta ? 'unlock' : 'create'; UI.vaultMeta = meta; render();
@@ -1393,7 +1437,7 @@ const SYNC_ACT = {
     try{
       if(await Sync.vault()){ busy(btn,false); UI.syncStep='unlock'; UI.vaultMeta = await Sync.vault(); render(); return toast('A family vault already exists — enter its passphrase'); }
       await Sync.createVault(p1);
-      DEV.mode = 'cloud'; DEV.lastTs = 0; saveDev();
+      DEV.mode = 'cloud'; DEV.lastTsUs = 0; saveDev();
       Sync.markAll(); persistLocal(); await Sync.push(); Sync.listen();
       UI.syncStep = null; render(); toast('Family sync is on');
     }catch(e){ busy(btn,false); err.innerHTML = esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
@@ -1404,8 +1448,8 @@ const SYNC_ACT = {
     try{
       const meta = UI.vaultMeta || await Sync.vault(); if(!meta) throw new Error('No family vault found yet — set up the first phone first.');
       await Sync.unlock(p1, meta);
-      if(DEV.mode!=='cloud'){ S = blank(); S.settings.at = 0; DIRTY.clear(); DEV.mode='cloud'; DEV.lastTs = 0; saveDev(); recompute(); persistLocal(); }
-      Sync.listen(); Sync.push(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — syncing');
+      if(DEV.mode!=='cloud'){ S = blank(); S.settings.at = 0; DIRTY.clear(); DEV.mode='cloud'; DEV.lastTsUs = 0; saveDev(); recompute(); persistLocal(); }
+      Sync.listen(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — downloading family data…');
     }catch(e){ busy(btn,false); err.innerHTML = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : esc(fbError(e,'db')) + `<div class="faint" style="margin-top:6px;word-break:break-word">Details for support: ${fbDetail(e)}</div>`; }
   },
   copyCode: async ()=>{ const t = setupCode(); try{ await navigator.clipboard.writeText(t); toast('Setup code copied'); }catch(e){ const el=document.getElementById('scode'); el.focus(); el.select(); toast('Long-press the code and choose Copy'); } },
@@ -1877,12 +1921,13 @@ if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigat
 try{ history.replaceState({tab:'home',bucket:null,sub:null},''); }catch(e){}
 (async ()=>{
   await loadState();
-  try{ const m = localStorage.getItem('mw.mockfb'); if(m) DEV.mockFb = m; }catch(e){}   // test hook only
+  try{ const m = localStorage.getItem('mw.mockfb'); if(m){ DEV.mockFb = m; DEV.mockRest = m+'v1/'; } }catch(e){}   // test hook only
   if(S.holdings.length) save();
   render();
   if(DEV.mode==='cloud') Sync.resume();
 })();
-window.addEventListener('online', ()=>{ if(DEV.mode==='cloud'){ if(Sync.state==='offline') Sync.resume(); else Sync.push(); } scheduleRender(); });
+window.addEventListener('online', ()=>{ if(DEV.mode==='cloud'){ if(!Sync.user) Sync.resume(); else Sync.poll(); } scheduleRender(); });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && DEV.mode==='cloud' && Sync.user) Sync.poll(); });
 window.addEventListener('offline', scheduleRender);
 // Only redraw when the screen WIDTH changes (rotation). The keyboard opening changes only the height
 // and must not redraw the page, or the box you're typing in gets replaced and the keyboard closes.
