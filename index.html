@@ -847,7 +847,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.0 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.0.1 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -1254,7 +1254,9 @@ function applyRemote(id, o){
   return false;
 }
 let _rT = null;
-function scheduleRender(){ clearTimeout(_rT); _rT = setTimeout(()=>{ UI.keepScroll = true; render(); }, 250); }
+function typing(){ const a=document.activeElement; return !!a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && document.getElementById('app').contains(a); }
+// Background updates (e.g. from the other phone) wait until you've finished typing on the page
+function scheduleRender(){ clearTimeout(_rT); _rT = setTimeout(()=>{ if(typing()){ scheduleRender(); return; } UI.keepScroll = true; render(); }, 250); }
 
 function syncPill(){
   if(DEV.mode!=='cloud') return '';
@@ -1843,7 +1845,10 @@ try{ history.replaceState({tab:'home',bucket:null,sub:null},''); }catch(e){}
 })();
 window.addEventListener('online', ()=>{ if(DEV.mode==='cloud'){ if(Sync.state==='offline') Sync.resume(); else Sync.push(); } scheduleRender(); });
 window.addEventListener('offline', scheduleRender);
-window.addEventListener('resize', ()=>{ clearTimeout(window._rt); window._rt=setTimeout(()=>{UI.keepScroll=true;render();},200); });
+// Only redraw when the screen WIDTH changes (rotation). The keyboard opening changes only the height
+// and must not redraw the page, or the box you're typing in gets replaced and the keyboard closes.
+let _lastW = window.innerWidth;
+window.addEventListener('resize', ()=>{ if(window.innerWidth===_lastW) return; _lastW = window.innerWidth; clearTimeout(window._rt); window._rt=setTimeout(()=>{ if(typing()) return; UI.keepScroll=true; render(); },200); });
 </script>
 </body>
 </html>
