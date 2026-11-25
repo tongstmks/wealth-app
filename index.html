@@ -86,6 +86,10 @@ input[type=checkbox]{width:22px;height:22px;flex:none}
 nav.tabs{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);display:flex;padding-bottom:env(safe-area-inset-bottom);z-index:10}
 nav.tabs button{flex:1;border:0;border-radius:0;background:transparent;padding:8px 0 10px;font-size:12px;color:var(--text-3);display:flex;flex-direction:column;align-items:center;gap:2px;min-height:60px}
 nav.tabs button.on{color:var(--accent);font-weight:600}
+nav.tabs button:active{background:var(--surface-2)}
+button,.list-item,.tile,.card.tap,.alert,.chip{transition:opacity .08s, transform .08s}
+button:active,.chip:active{transform:scale(.97);opacity:.75}
+.list-item:active,.tile:active,.card.tap:active,.alert:active{opacity:.6}
 nav.tabs svg{width:23px;height:23px}
 .fab{position:fixed;right:18px;bottom:calc(78px + env(safe-area-inset-bottom));height:56px;padding:0 20px 0 16px;border-radius:28px;background:var(--accent);color:#fff;border:0;font-size:16px;font-weight:600;box-shadow:0 4px 14px rgba(0,0,0,.25);z-index:11;display:flex;align-items:center;gap:6px}
 .fab b{font-size:26px;line-height:1;font-weight:500}
@@ -222,12 +226,19 @@ function migrate(d){
   delete out.flowB; out.v = 3;
   return out;
 }
-/* Derive balances: holding value = base value + every movement recorded after the base was set */
+/* Calculations are remembered until the data changes (VER goes up), so switching screens stays fast */
+let VER = 0; const MEMO = new Map();
+function memo(key, fn){ const k = VER + '|' + key; if(MEMO.has(k)) return MEMO.get(k); if(MEMO.size > 400) MEMO.clear(); const v = fn(); MEMO.set(k, v); return v; }
+const bump = () => { VER++; };
+/* Derive balances: holding value = base value + every movement made after the base was set.
+   A movement's effect time is when it was first recorded (ct), so editing it later doesn't change that. */
 function recompute(){
+  bump();
   const hm = {}; S.holdings.forEach(h=>{ h.value = h.base||0; h.cost = h.baseCost||0; hm[h.id]=h; });
   const fb = {}; S.buckets.forEach(b=>fb[b.id]=b.flow0||0);
   MOVES.forEach(k=>S[k].forEach(m=>{
-    (m.d||[]).forEach(x=>{ const h=hm[x.h]; if(h && (m.at||0)>(h.baseAt||0)){ h.value+=x.v||0; h.cost+=x.c||0; } });
+    const t = m.ct || m.at || 0;
+    (m.d||[]).forEach(x=>{ const h=hm[x.h]; if(h && t>(h.baseAt||0)){ h.value+=x.v||0; h.cost+=x.c||0; } });
     (m.f||[]).forEach(x=>{ if(fb[x.b]!=null) fb[x.b]+=x.a||0; });
   }));
   S.holdings.forEach(h=>{ h.value=Math.round(h.value*100)/100; if(h.type==='cash') h.cost=h.value; });
@@ -236,12 +247,13 @@ function recompute(){
 function investedFlowsSince(b){
   if(!b.baseline) return 0; const at=b.baseline.at||0; let tot=0;
   const ids = new Set(holdingsOf(b.id).filter(h=>h.type!=='cash').map(h=>h.id));
-  MOVES.forEach(k=>S[k].forEach(m=>{ if((m.at||0)>at) (m.d||[]).forEach(x=>{ if(ids.has(x.h)) tot+=x.v||0; }); }));
+  MOVES.forEach(k=>S[k].forEach(m=>{ if((m.ct||m.at||0)>at) (m.d||[]).forEach(x=>{ if(ids.has(x.h)) tot+=x.v||0; }); }));
   return tot;
 }
 /* Every change goes through put()/drop() so it can be synced */
 function put(kind, rec){
   rec.at = Date.now();
+  if(MOVES.includes(kind)){ if(!rec.ct) rec.ct = rec.at; if(!rec.by && myName()) rec.by = myName(); }
   if(kind==='settings'){ S.settings = rec; }
   else { if(!rec.id) rec.id = uid(); const arr=S[kind]; const i=arr.findIndex(x=>x.id===rec.id); if(i>=0) arr[i]=rec; else arr.push(rec); }
   if(DEV.mode==='cloud') DIRTY.set(rec.id, {kind, del:false});
@@ -249,16 +261,17 @@ function put(kind, rec){
 }
 function drop(kind, id){ S[kind] = S[kind].filter(x=>x.id!==id); if(DEV.mode==='cloud') DIRTY.set(id, {kind, del:true}); }
 const putSettings = () => put('settings', S.settings);
+const myName = () => DEV.name || (DEV.mode==='cloud' && DEV.email ? DEV.email.split('@')[0] : '');
 function save(){ recompute(); takeSnapshot(); persistLocal(); Sync.push(); }
 let _persistT = null;
 function persistLocal(){
   clearTimeout(_persistT);
   _persistT = setTimeout(async ()=>{
-    const ok = await IDB.set('state', JSON.parse(JSON.stringify(S)));
+    const ok = await IDB.set('state', S);   // IndexedDB copies it directly
     await IDB.set('outbox', [...DIRTY.entries()].map(([id,x])=>[id,x.kind,x.del]));
     if(!ok){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){ toast('Could not save on this device: '+e.message); } }
     else { try{ localStorage.removeItem(STORE_KEY); }catch(e){} }
-  }, 50);
+  }, 200);
 }
 function saveDev(){ IDB.set('dev', {...DEV}).then(ok=>{ if(!ok) try{ localStorage.setItem(STORE_KEY+'.dev', JSON.stringify(DEV)); }catch(e){} }); }
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
@@ -275,7 +288,11 @@ const sgn = n => n>0?'+':'';
 function short(n){ const a=Math.abs(n); if(a>=1e6) return (n<0?'−':'')+'฿'+(a/1e6).toFixed(a>=1e7?1:2)+'M'; if(a>=1e3) return (n<0?'−':'')+'฿'+(a/1e3).toFixed(0)+'k'; return B(n); }
 const num = v => { const n = parseFloat(String(v??'').replace(/[,฿\s]/g,'')); return isFinite(n)?n:0; };
 const sum = arr => arr.reduce((a,b)=>a+(b||0),0);
-const fmtDate = s => parseD(s).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
+// Date formatters are created once and reused (creating them for every row is slow on phones)
+const DF_DAY = new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric'});
+const DF_MONTH = new Intl.DateTimeFormat('en-GB',{month:'long',year:'numeric'});
+const DF_AXIS = new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'2-digit'});
+const fmtDate = s => DF_DAY.format(parseD(s));
 const nowYear = () => new Date().getFullYear();
 
 /* ================= Lookups ================= */
@@ -289,7 +306,8 @@ const totalValue = () => sum(S.holdings.map(h=>h.value));
 const flowOf = bid => bid==='all' ? sum(S.buckets.map(b=>S.flowB[b.id]||0)) : (S.flowB[bid]||0);
 const cashHoldings = () => S.holdings.filter(h=>h.type==='cash');
 function holdingLabel(h){ const a=acc(h.accountId), b=bkt(h.bucketId); return `${h.name}${a?' · '+a.name:''}${b?' ('+b.name+')':''}`; }
-function byType(bid){ const out={}; TYPES.forEach(t=>out[t.k]=0); holdingsOf(bid).forEach(h=>out[h.type]=(out[h.type]||0)+h.value); return out; }
+const byType = bid => memo('bt'+bid, ()=>_byType(bid));
+function _byType(bid){ const out={}; TYPES.forEach(t=>out[t.k]=0); holdingsOf(bid).forEach(h=>out[h.type]=(out[h.type]||0)+h.value); return out; }
 
 function takeSnapshot(){
   if(!S.holdings.length && !S.snaps.length) return;
@@ -298,13 +316,33 @@ function takeSnapshot(){
   S.buckets.forEach(b=>{ snap.b[b.id]=Math.round(bucketValue(b.id)); snap.fb[b.id]=Math.round(flowOf(b.id)); });
   const old = S.snaps.find(x=>x.d===d);
   if(old && old.t===snap.t && old.f===snap.f && JSON.stringify(old.b)===JSON.stringify(snap.b) && JSON.stringify(old.fb)===JSON.stringify(snap.fb)) return;
-  put('snaps', snap); S.snaps.sort((a,b)=>a.d<b.d?-1:1);
+  put('snaps', snap); S.snaps.sort((a,b)=>a.d<b.d?-1:1); bump();
 }
 
 /* ================= Returns, fees, assumptions ================= */
-function bucketMix(b){ // % weights per type: target if set, else current
-  const tsum = sum(Object.values(b.targets||{}));
-  if(tsum===100) return b.targets;
+/* Glide path: a goal bucket's target mix moves gradually from its starting mix to a safer mix
+   over the N years before its first withdrawal (or target year). */
+function glideStartYear(b){
+  const g = b.goal; if(!g || !g.kind) return null;
+  if(g.kind==='withdrawals'){ const r = (g.rows||[]).filter(x=>num(x.amt)>0 && num(x.from)>0); return r.length ? Math.min(...r.map(x=>num(x.from))) : null; }
+  return num(g.target?.year) || null;
+}
+const glideOn = b => !!(b.goal && b.goal.kind && b.goal.glide && b.goal.glide.on && Math.round(sum(Object.values(b.targets||{})))===100 && glideStartYear(b));
+function mixForYear(b, y){
+  const base = b.targets||{}; if(!glideOn(b)) return base;
+  const yrs = Math.max(1, num(b.goal.glide.years)||5), fin = b.goal.glide.mix||{}, start = glideStartYear(b);
+  const t = Math.max(0, Math.min(1, (y - (start - yrs)) / yrs)); if(t<=0) return base;
+  const out = {}; TYPES.forEach(({k})=>{ const v = (base[k]||0)*(1-t) + (fin[k]||0)*t; if(v>0.05) out[k] = Math.round(v*10)/10; });
+  const diff = Math.round((100 - sum(Object.values(out)))*10)/10;
+  if(diff){ const big = Object.keys(out).sort((a,c)=>out[c]-out[a])[0]; out[big] = Math.round((out[big]+diff)*10)/10; }
+  return out;
+}
+const effTargets = b => mixForYear(b, nowYear());
+const tsumOf = t => Math.round(sum(Object.values(t||{}))*10)/10;
+
+function bucketMix(b){ // % weights per type: this year's target if set, else current mix
+  const tg = effTargets(b);
+  if(tsumOf(tg)===100) return tg;
   const v = bucketValue(b.id), bt = byType(b.id), out={};
   if(v>0) TYPES.forEach(t=>{ if(bt[t.k]) out[t.k]=bt[t.k]/v*100; });
   return out;
@@ -321,7 +359,8 @@ function currentExpected(bid){ // based on CURRENT mix — for comparing with ac
 }
 
 /* Actual performance (Modified Dietz, last 12 months or since start) */
-function performance(bid){
+const perfOf = bid => memo('pf'+bid, ()=>_perfOf(bid));
+function _perfOf(bid){
   const cut = new Date(); cut.setDate(cut.getDate()-365); const c=iso(cut);
   const start = S.snaps.find(s=>s.d>=c && (bid==='all' ? s.t>0 : (s.b?.[bid]||0)>0));
   if(!start) return null;
@@ -336,9 +375,10 @@ function performance(bid){
 }
 
 /* ================= Rebalancing ================= */
-function analyse(b){
+const analyse = b => memo('an'+b.id, ()=>_analyse(b));
+function _analyse(b){
   const val = bucketValue(b.id), bt = byType(b.id);
-  const targets = b.targets||{}; const tsum = sum(Object.values(targets));
+  const targets = effTargets(b); const tsum = tsumOf(targets);
   const rows = TYPES.filter(t=>(targets[t.k]||0)>0 || bt[t.k]>0).map(t=>{
     const cur = val? bt[t.k]/val*100 : 0, tgt = targets[t.k]||0;
     return { k:t.k, value:bt[t.k], cur, tgt, drift:cur-tgt, diff: val*tgt/100 - bt[t.k] };
@@ -383,9 +423,12 @@ function contributionSplit(b, C){
 }
 
 /* ================= Goals & projections ================= */
-function goalProjection(b){
+const goalProjection = b => memo('gp'+b.id, ()=>_goalProjection(b));
+function _goalProjection(b){
   const g = b.goal; if(!g || !g.kind) return null;
-  const r = bucketExpected(b).net/100, infl = (g.growth ?? S.settings.inflation)/100;
+  const infl = (g.growth ?? S.settings.inflation)/100, fee = feePct(holdingsOf(b.id));
+  const baseOk = tsumOf(b.targets)===100;
+  const rFor = y => (mixReturn(baseOk ? mixForYear(b, y) : bucketMix(b)) - fee)/100;   // return follows the glide path
   const Y0 = nowYear(); const V = bucketValue(b.id);
   const cAmt = num(g.contrib?.amt), cUntil = num(g.contrib?.until)||0;
   const contribIn = y => (cAmt>0 && y<=cUntil) ? cAmt : 0;
@@ -399,30 +442,30 @@ function goalProjection(b){
     if(!(num(g.target?.amt)>0 && num(g.target?.year)>=Y0)) return null;
     lastYear = num(g.target.year); withdrawIn = ()=>0;
   }
-  const years = []; let bal = V, runsOut = null;
+  const years = [], growth = []; let bal = V, runsOut = null, G = 1;
   for(let y=Y0; y<=lastYear; y++){
-    const start = bal, c = contribIn(y), w = withdrawIn(y);
-    bal = start*(1+r) + c - w;
+    const r = rFor(y), start = bal, c = contribIn(y), w = withdrawIn(y);
+    bal = start*(1+r) + c - w; G *= (1+r); growth.push(G);
     if(bal<0 && runsOut===null) runsOut = y;
-    years.push({y, start, c, w, end:bal});
+    years.push({y, start, c, w, end:bal, r});
   }
   let funded, need, extra = 0;
-  const disc = t => Math.pow(1+r, t);
   if(g.kind==='withdrawals'){
-    const pvW = sum(years.map((x,i)=>x.w/disc(i+1))), pvC = sum(years.map((x,i)=>x.c/disc(i+1)));
+    const pvW = sum(years.map((x,i)=>x.w/growth[i])), pvC = sum(years.map((x,i)=>x.c/growth[i]));
     need = pvW; funded = pvW-pvC>0 ? V/(pvW-pvC)*100 : 999;
     const shortfall = pvW - pvC - V;
-    if(shortfall>0){ const firstW = years.findIndex(x=>x.w>0); const n = firstW>0? firstW : years.length; extra = shortfall / sum(Array.from({length:n},(_,i)=>1/disc(i+1))); }
+    if(shortfall>0){ const firstW = years.findIndex(x=>x.w>0); const n = firstW>0? firstW : years.length; extra = shortfall / sum(growth.slice(0,n).map(x=>1/x)); }
   } else {
-    const n = lastYear-Y0+1; need = num(g.target.amt)*Math.pow(1+infl, n);
+    const n = years.length; need = num(g.target.amt)*Math.pow(1+infl, n);
     funded = need>0 ? bal/need*100 : 999;
-    if(bal<need){ const fvA = sum(Array.from({length:n},(_,i)=>Math.pow(1+r, n-1-i))); extra = (need-bal)/fvA; }
+    if(bal<need){ const fvA = sum(growth.map(x=>growth[n-1]/x)); extra = (need-bal)/fvA; }
   }
-  return { r:r*100, years, runsOut, funded, need, extra, lastYear, end:bal };
+  return { r:rFor(Y0)*100, rEnd:years.length ? years[years.length-1].r*100 : rFor(Y0)*100, years, runsOut, funded, need, extra, lastYear, end:bal };
 }
 
 /* ================= Money flows over time ================= */
-function windowStats(){
+const windowStats = () => memo('ws', _windowStats);
+function _windowStats(){
   // last 12 months (or since the app started, if newer), scaled to a full year
   const cut = new Date(); cut.setDate(cut.getDate()-365);
   const created = parseD(S.settings.created||today());
@@ -438,7 +481,8 @@ function windowStats(){
   const invInc = sum(inc.filter(i=>i.src===RETURN_SOURCE).map(i=>i.amt));
   return { days, scale, livingYr: living*scale, goalSpendYr: goalSpend*scale, earnedYr: earned*scale, invIncYr: invInc*scale, short: days<60 };
 }
-function sustainability(){
+const sustainability = () => memo('su', _sustainability);
+function _sustainability(){
   const perm = S.buckets.filter(b=>b.permanent);
   const P = sum(perm.map(b=>bucketValue(b.id)));
   const nom = P>0 ? sum(perm.map(b=>bucketValue(b.id)*bucketExpected(b).net))/P : 0;
@@ -453,8 +497,30 @@ function sustainability(){
   return { perm, P, nom, real, D, w, gap, needCapital, fiNeed, fi: isFinite(fiNeed)&&fiNeed>0 ? P/fiNeed*100 : 0, state };
 }
 
+/* ================= Safety checks ================= */
+const SAFETY_DEFAULT = { emBucket:'', months:6, excessMonths:12, monthly:'', dpOn:true, dpLimit:1000000 };
+const safetyCfg = () => Object.assign({}, SAFETY_DEFAULT, S.settings.safety||{});
+const emergencyBucket = () => { const c = safetyCfg(); return (c.emBucket && bkt(c.emBucket)) || S.buckets.find(b=>/emergenc|ฉุกเฉิน/i.test(b.name)) || null; };
+const emergencyStatus = () => memo('em', ()=>{
+  const c = safetyCfg(), b = emergencyBucket(); if(!b) return null;
+  const auto = windowStats().livingYr/12, monthly = num(c.monthly) || auto;
+  const val = bucketValue(b.id); if(!(monthly>0)) return { b, val, monthly:0, months:null, c };
+  const months = val/monthly, need = Math.max(0, c.months*monthly - val), excess = Math.max(0, val - c.excessMonths*monthly);
+  return { b, val, monthly, auto, months, need, excess, c, state: months < c.months*0.8 ? 'serious' : months < c.months ? 'warn' : excess>0 ? 'warn' : 'good' };
+});
+const depositStatus = () => memo('dp', ()=>{
+  const c = safetyCfg(); if(!c.dpOn) return { groups:[], over:[], c };
+  const g = {};
+  S.holdings.filter(h=>h.type==='cash').forEach(h=>{ const a = acc(h.accountId); if(!a || a.kind!=='bank') return;
+    const key = (a.institution||a.name).trim() + (a.holder ? ' · ' + a.holder.trim() : '');
+    g[key] = (g[key]||0) + h.value; });
+  const groups = Object.entries(g).map(([name,v])=>({name, v})).sort((a,b)=>b.v-a.v);
+  return { groups, over: groups.filter(x=>x.v > c.dpLimit), c };
+});
+
 /* ================= Budget ================= */
-function budgetStatus(year){
+const budgetStatus = year => memo('bs'+year, ()=>_budgetStatus(year));
+function _budgetStatus(year){
   const budget = num(S.settings.budgets[year]||0);
   const exp = S.expenses.filter(e=>e.date.startsWith(String(year)));
   const spent = sum(exp.map(e=>e.amt));
@@ -475,7 +541,8 @@ function budgetStatus(year){
 
 /* ================= Alerts ================= */
 const LVL = { good:['var(--good)','✓'], warn:['var(--warn)','!'], serious:['var(--serious)','!'], crit:['var(--crit)','!'], none:['var(--surface-2)','?'] };
-function alerts(){
+const alerts = () => memo('al', _alerts);
+function _alerts(){
   const out = [];
   const su = sustainability();
   if(su.state==='crit'||su.state==='warn') out.push({lvl:su.state==='crit'?'crit':'serious', text:`<b>Spending is eating into capital</b> by about ${B(su.gap)} a year.`, go:()=>go({tab:'plan'})});
@@ -486,6 +553,15 @@ function alerts(){
     const gp = goalProjection(b);
     if(gp && gp.funded<85) out.push({lvl:gp.funded<60?'serious':'warn', text:`<b>${esc(b.name)}</b> goal is ${Math.round(gp.funded)}% funded. Saving about ${B(gp.extra)} more a year would close the gap.`, go:()=>go({tab:'buckets',bucket:b.id})});
   });
+  const em = emergencyStatus();
+  if(em && em.months!==null && em.state!=='good'){
+    if(em.months < em.c.months) out.push({lvl:em.state, text:`<b>Emergency fund</b> covers ${em.months.toFixed(1)} months (target ${em.c.months}). Add about ${B(em.need)}.`, go:()=>go({tab:'plan'})});
+    else if(em.excess>0) out.push({lvl:'warn', text:`<b>Emergency fund</b> has ${B(em.excess)} more than ${em.c.excessMonths} months of costs — that could be invested.`, go:()=>go({tab:'plan'})});
+  }
+  const dp = depositStatus();
+  dp.over.forEach(x=>out.push({lvl:'warn', text:`<b>${esc(x.name)}</b>: ${B(x.v)} in cash — ${B(x.v-dp.c.dpLimit)} above the ${B(dp.c.dpLimit)} deposit protection limit.`, go:()=>go({tab:'plan'})}));
+  const rv = reviewStatus();
+  if(rv.due) out.push({lvl:'warn', text:`<b>Annual review ${rv.year}</b>: ${rv.done} of ${rv.total} done.`, go:()=>go({tab:'more',sub:'review'})});
   const bs = budgetStatus(nowYear());
   if(bs.budget>0 && bs.state!=='good'){
     const msg = bs.state==='crit' ? `Over your ${nowYear()} budget by ${B(-bs.remaining)}.` :
@@ -517,7 +593,7 @@ function lineChart(el, series, opts={}){
   const X = t => pl + (x1===x0?0:(t-x0)/(x1-x0))*(W-pl-pr);
   const Y = v => pt + (1-(v-y0)/(y1-y0))*(H-pt-pb);
   const ticks = niceTicks(y0,y1,4);
-  const fmtX = t => opts.yearly ? String(new Date(t).getFullYear()) : new Date(t).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'2-digit'});
+  const fmtX = t => opts.yearly ? String(new Date(t).getFullYear()) : DF_AXIS.format(new Date(t));
   const g = ticks.map(v=>`<line x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="${v===0&&y0<0?'var(--text-3)':'var(--line)'}" stroke-width="1"/><text x="${W-pr+6}" y="${Y(v)+4}" font-size="11" fill="var(--text-3)">${short(v)}</text>`).join('');
   const dl = [x0,(x0+x1)/2,x1].map((t,i)=>`<text x="${X(t)}" y="${H-5}" font-size="11" fill="var(--text-3)" text-anchor="${['start','middle','end'][i]}">${fmtX(t)}</text>`).join('');
   const paths = series.map(s=>`<path d="${s.pts.map((p,i)=>(i?'L':'M')+X(parseD(p[0]).getTime()).toFixed(1)+','+Y(p[1]).toFixed(1)).join('')}" fill="none" stroke="${s.color}" stroke-width="2" ${s.dash?'stroke-dasharray="4 4"':''} stroke-linejoin="round" stroke-linecap="round"/>`).join('');
@@ -545,6 +621,7 @@ function progressBar(p, color, h=10){ return `<div class="bar" style="height:${h
 function seriesFor(bid, range){
   let snaps = S.snaps.slice();
   if(range!=='All'){ const days={'1M':31,'3M':92,'1Y':366,'3Y':1096}[range]; const cut=new Date(); cut.setDate(cut.getDate()-days); const c=iso(cut); snaps=snaps.filter(s=>s.d>=c); }
+  if(snaps.length > 120){ const k = Math.ceil(snaps.length/120); snaps = snaps.filter((x,i)=>i%k===0 || i===snaps.length-1); }
   const v = snaps.map(s=>[s.d, bid==='all'? s.t : (s.b?.[bid]??0)]);
   const f = snaps.map(s=>[s.d, bid==='all'? (s.f ?? s.c ?? 0) : (s.fb?.[bid] ?? s.bc?.[bid] ?? 0)]);
   return [{name:'Value', color:'var(--accent)', pts:v},{name:'Money put in', color:'var(--cost)', dash:true, pts:f}];
@@ -577,12 +654,12 @@ function renderTabs(){
 function render(){
   renderTabs();
   const app = document.getElementById('app');
-  const fab = document.getElementById('fab'); fab.style.display = (UI.sub==='handover'||UI.sub==='guide'||UI.sub==='sync') ? 'none' : '';
+  const fab = document.getElementById('fab'); fab.style.display = ['handover','guide','sync','review'].includes(UI.sub) ? 'none' : '';
   if(UI.tab==='home') app.innerHTML = viewHome();
   else if(UI.tab==='buckets') app.innerHTML = UI.bucket ? viewBucket(UI.bucket) : viewBuckets();
   else if(UI.tab==='money') app.innerHTML = viewMoney();
   else if(UI.tab==='plan') app.innerHTML = viewPlan();
-  else app.innerHTML = UI.sub==='guide' ? viewGuide() : UI.sub==='sync' ? viewSync() : UI.sub==='insurance' ? viewInsurance() : UI.sub==='handover' ? viewHandover() : UI.sub==='accounts' ? viewAccounts() : viewMore();
+  else app.innerHTML = UI.sub==='guide' ? viewGuide() : UI.sub==='review' ? viewReview() : UI.sub==='sync' ? viewSync() : UI.sub==='insurance' ? viewInsurance() : UI.sub==='handover' ? viewHandover() : UI.sub==='accounts' ? viewAccounts() : viewMore();
   bindView();
   if(!UI.keepScroll) window.scrollTo(0,0); UI.keepScroll=false;
 }
@@ -617,7 +694,7 @@ function viewHome(){
   <div class="card">
     <h2>Wealth over time</h2>
     <div class="chips" style="margin:4px 0 6px">${[['all','All'],...S.buckets.map(b=>[b.id,b.name])].map(([k,n])=>`<button class="chip ${UI.chartBucket===k?'on':''}" data-cb="${k}">${esc(n)}</button>`).join('')}</div>
-    <div id="homeChart"></div>${rangeChips()}
+    <div id="homeChart" style="min-height:212px"></div>${rangeChips()}
   </div>
   <div class="card">
     <div class="row between"><h2 style="margin:0">Buckets</h2><button class="ghost" data-go="buckets">See all ›</button></div>
@@ -659,12 +736,12 @@ function viewBucket(id){
   const b = bkt(id); if(!b){ UI.bucket=null; return viewBuckets(); }
   const a = analyse(b), hs = holdingsOf(id).sort((x,y)=>y.value-x.value);
   const put = flowOf(id), gain = a.val-put;
-  const plan = rebalancePlan(b), ex = bucketExpected(b), perf = performance(id);
+  const plan = rebalancePlan(b), ex = bucketExpected(b), perf = perfOf(id);
   return `<div class="row between">${backBtn('Buckets',{tab:'buckets'})}<button class="ghost" data-act="editBucket" data-id="${id}">Edit bucket</button></div>
   <h1 style="margin-top:0">${esc(b.name)}${b.permanent?' <span class="faint">♾ permanent</span>':''}</h1>
   <div class="card"><div class="faint">${esc(b.purpose||'Bucket value')}</div><div class="hero">${B(a.val)}</div>
     <div class="faint">Growth on money put in: <b class="num ${gain>=0?'pos':'neg'}">${sgn(gain)}${B(gain)}</b>${perf&&!perf.tooShort?` · return ${sgn(perf.annual)}${pct(perf.annual)}/yr`:''}</div>
-    <div id="bucketChart" style="margin-top:10px"></div>${rangeChips()}
+    <div id="bucketChart" style="margin-top:10px;min-height:160px"></div>${rangeChips()}
   </div>
   ${goalCard(b)}
   <div class="card"><h2>Mix vs target</h2>
@@ -675,6 +752,7 @@ function viewBucket(id){
     <table style="margin-top:10px"><tr><th>Type</th><th>Value</th><th>Now</th><th>Target</th><th>Off by</th></tr>
     ${a.rows.map(r=>{ const off=Math.abs(r.drift)>(b.threshold??5) && a.tsum===100; return `<tr><td><span class="dot" style="background:${tColor(r.k)};width:8px;height:8px"></span> ${TYPE_NAME[r.k]}</td><td class="num">${B(r.value)}</td><td class="num">${pct(r.cur)}</td><td class="num">${r.tgt}%</td><td class="num" style="${off?'font-weight:700':''}">${off?'⚠ ':''}${sgn(r.drift)}${r.drift.toFixed(1)}</td></tr>`; }).join('')}
     </table>
+    ${glideOn(b) ? `<p class="faint">🛬 <b>Glide path on:</b> the target moves from your starting mix to a safer mix between ${glideStartYear(b)-Math.max(1,num(b.goal.glide.years)||5)} and ${glideStartYear(b)}. The target shown is this year's. Change it in Edit goal.</p>` : ''}
     <p class="faint">Expected return of this mix: ${pct(ex.gross)}/yr, minus fees ${pct(ex.fee,2)} = <b>${pct(ex.net)}/yr</b>.</p>
   </div>
   ${rebalanceCard(b,plan)}
@@ -696,7 +774,7 @@ function goalCard(b){
     ${progressBar(gp.funded, LVL[state][0])}
     <div class="kv" style="margin-top:10px"><span class="k">${g.kind==='withdrawals'?'Planned spending':'Target'}</span><span class="num">${g.kind==='withdrawals'? (g.rows||[]).filter(r=>num(r.amt)>0).map(r=>`${B(num(r.amt))}/yr ${r.from}${r.to&&r.to!=r.from?'–'+r.to:''}`).join('<br>') : `${B(num(g.target.amt))} by ${g.target.year}`}</span></div>
     ${num(g.contrib?.amt)>0?`<div class="kv"><span class="k">You'll add</span><span class="num">${B(num(g.contrib.amt))}/yr until ${g.contrib.until}</span></div>`:''}
-    <div class="kv"><span class="k">Assumed return (after fees)</span><span class="num">${pct(gp.r)}/yr</span></div>
+    <div class="kv"><span class="k">Assumed return (after fees)</span><span class="num">${glideOn(b) && Math.abs(gp.r-gp.rEnd)>0.05 ? `${pct(gp.r)} → ${pct(gp.rEnd)}/yr` : pct(gp.r)+'/yr'}</span></div>
     <div class="kv"><span class="k">Costs rise by</span><span class="num">${pct(g.growth ?? S.settings.inflation)}/yr</span></div>
     <h3>Projected balance</h3><div id="goalChart"></div>
     <p class="faint">Amounts are in today's baht and grow with the cost increase each year. This is a projection, not a promise.</p>
@@ -709,7 +787,7 @@ function rebalanceCard(b,plan){
   plan.sells.forEach(s=>{ if(s.amt>1) recs.push(`<div class="rec">Sell <b class="num">${B(s.amt)}</b> of ${TYPE_NAME[s.k]}${s.h?` — e.g. from <b>${esc(s.h.name)}</b>`:''}</div>`); });
   plan.buys.forEach(x=>{ recs.push(`<div class="rec">Buy <b class="num">${B(x.amt)}</b> of ${TYPE_NAME[x.k]}${x.h?` — e.g. into <b>${esc(x.h.name)}</b>`:' — <i>no holding of this type yet</i>'}</div>`); });
   return `<div class="card"><h2>Rebalancing</h2>
-    ${a.reasons.length? a.reasons.map(r=>`<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:${LVL[r.lvl][0]}">!</span><div>${esc(r.text)}</div></div>`).join('') : `<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:var(--good)">✓</span><div>Within limits. Next review: ${a.due.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}.</div></div>`}
+    ${a.reasons.length? a.reasons.map(r=>`<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:${LVL[r.lvl][0]}">!</span><div>${esc(r.text)}</div></div>`).join('') : `<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:var(--good)">✓</span><div>Within limits. Next review: ${DF_DAY.format(a.due)}.</div></div>`}
     <h3>${a.needs?'Recommended moves':'To be exactly on target you would'}</h3>
     ${recs.join('') || '<div class="faint">Already on target.</div>'}
     ${plan.lockedNote.map(n=>`<div class="faint">🔒 ${esc(n)}</div>`).join('')}
@@ -731,7 +809,9 @@ function viewMoney(){
   const list = isExp ? bs.exp : bs.inc;
   const cats = {}; list.forEach(e=>{ const k=isExp?e.cat:e.src; cats[k]=(cats[k]||0)+e.amt; });
   const catRows = Object.entries(cats).sort((a,b)=>b[1]-a[1]); const maxC = catRows[0]?.[1]||1; const tot = sum(catRows.map(c=>c[1]));
-  const byMonth = {}; [...list].sort((a,b)=>a.date<b.date?1:-1).forEach(e=>{ const m=e.date.slice(0,7); (byMonth[m]=byMonth[m]||[]).push(e); });
+  const people = [...new Set(list.map(e=>e.by).filter(Boolean))];
+  const shown = (UI.byFilter && people.includes(UI.byFilter)) ? list.filter(e=>e.by===UI.byFilter) : list;
+  const byMonth = {}; [...shown].sort((a,b)=>a.date<b.date?1:-1).forEach(e=>{ const m=e.date.slice(0,7); (byMonth[m]=byMonth[m]||[]).push(e); });
   return `<div class="row between"><h1>Money</h1><select id="yearSel" style="width:auto">${years.map(v=>`<option ${v===y?'selected':''}>${v}</option>`).join('')}</select></div>
   <div class="segctl"><button class="${isExp?'on':''}" data-mv="exp">Spending</button><button class="${!isExp?'on':''}" data-mv="inc">Income</button></div>
   <button class="primary block" style="margin-bottom:12px" data-act="${isExp?'addExpense':'addIncome'}">+ Record ${isExp?'expense':'income'}</button>
@@ -745,9 +825,10 @@ function viewMoney(){
   <div class="card"><h2>${isExp?'Spending':'Income'} by ${isExp?'category':'source'} · ${y}</h2>
     ${catRows.map(([c,v])=>`<div style="margin:10px 0"><div class="row between"><span>${esc(c)}</span><span class="num">${B(v)} <span class="faint">${pct(v/tot*100,0)}</span></span></div><div style="margin-top:4px">${progressBar(v/maxC*100,'var(--accent)',8)}</div></div>`).join('') || `<div class="faint">Nothing recorded in ${y} yet.</div>`}
   </div>
-  <div class="card"><h2>History</h2><p class="help">Tap a month to open it. Tap an entry to delete it.</p>
-    ${Object.entries(byMonth).map(([m,l],mi)=>{ const open = UI.openMonth ? UI.openMonth===m : mi===0; return `<h3 class="row between" data-month="${m}" data-open="${open?1:0}" style="cursor:pointer"><span>${open?'▾':'▸'} ${parseD(m+'-01').toLocaleDateString('en-GB',{month:'long',year:'numeric'})} <span class="faint">(${l.length})</span></span><span class="num">${B(sum(l.map(e=>e.amt)))}</span></h3>
-      ${!open?'':l.map(e=>{ const h=hld(e.hid); return `<div class="list-item" data-${isExp?'exp':'inc'}="${e.id}"><div class="grow"><div class="title">${esc(isExp?e.cat:e.src)}${e.note?` <span class="faint">· ${esc(e.note)}</span>`:''}</div><div class="faint">${fmtDate(e.date)} · ${esc(h?h.name:'Not a tracked account')}</div></div><b class="num ${isExp?'':'pos'}">${isExp?'':'+'}${B(e.amt)}</b></div>`; }).join('')}`; }).join('') || '<div class="faint">Nothing recorded.</div>'}
+  <div class="card"><h2>History</h2><p class="help">Tap a month to open it. Tap an entry to edit or delete it.</p>
+    ${people.length>1?`<div class="chips" style="margin-bottom:6px">${['', ...people].map(n=>`<button class="chip ${(UI.byFilter||'')===n?'on':''}" data-by="${esc(n)}">${n?esc(n):'Everyone'}</button>`).join('')}</div>`:''}
+    ${Object.entries(byMonth).map(([m,l],mi)=>{ const open = UI.openMonth ? UI.openMonth===m : mi===0; return `<h3 class="row between" data-month="${m}" data-open="${open?1:0}" style="cursor:pointer"><span>${open?'▾':'▸'} ${DF_MONTH.format(parseD(m+'-01'))} <span class="faint">(${l.length})</span></span><span class="num">${B(sum(l.map(e=>e.amt)))}</span></h3>
+      ${!open?'':l.map(e=>{ const h=hld(e.hid); return `<div class="list-item" data-${isExp?'exp':'inc'}="${e.id}"><div class="grow"><div class="title">${esc(isExp?e.cat:e.src)}${e.note?` <span class="faint">· ${esc(e.note)}</span>`:''}</div><div class="faint">${fmtDate(e.date)} · ${esc(h?h.name:'Not a tracked account')}${e.by?` · <b>${esc(e.by)}</b>`:''}</div></div><b class="num ${isExp?'':'pos'}">${isExp?'':'+'}${B(e.amt)}</b></div>`; }).join('')}`; }).join('') || '<div class="faint">Nothing recorded.</div>'}
   </div>`;
 }
 function budgetCard(y,bs){
@@ -771,7 +852,7 @@ function viewPlan(){
   const su = sustainability(); const w = su.w;
   const A = S.settings.assume;
   const goalB = S.buckets.filter(b=>goalProjection(b));
-  const perfRows = [...S.buckets.map(b=>({name:b.name,id:b.id})), {name:'Total',id:'all'}].map(x=>{ const p=performance(x.id); const exp = x.id==='all'? currentExpected('all') : currentExpected(x.id); return {...x,p,exp}; });
+  const perfRows = [...S.buckets.map(b=>({name:b.name,id:b.id})), {name:'Total',id:'all'}].map(x=>{ const p=perfOf(x.id); const exp = x.id==='all'? currentExpected('all') : currentExpected(x.id); return {...x,p,exp}; });
   const fees = S.holdings.filter(h=>h.ter>0).map(h=>({h, yr:h.value*h.ter/100})).sort((a,b)=>b.yr-a.yr);
   const feeYr = sum(fees.map(f=>f.yr)), feeAvg = feePct(S.holdings.filter(h=>h.type!=='cash'));
   let verdict;
@@ -794,6 +875,7 @@ function viewPlan(){
     `:''}
   </div>
 
+  ${safetyCard()}
   <div class="card"><h2>Goals</h2>
     ${goalB.map(b=>{ const gp=goalProjection(b); const st=gp.funded>=100?'good':gp.funded>=85?'warn':'serious'; return `<div class="list-item" data-bucket="${b.id}"><div class="grow"><div class="row between"><span class="title">${esc(b.name)}</span><b class="num">${Math.round(Math.min(gp.funded,999))}%</b></div><div style="margin:6px 0 4px">${progressBar(gp.funded, LVL[st][0], 8)}</div><div class="faint">${gp.funded>=100?'Fully funded at assumed returns':`Save ~${B(gp.extra)}/yr more`}${gp.runsOut?` · runs out ${gp.runsOut}`:''}</div></div><span class="chev">›</span></div>`; }).join('') || '<p class="help" style="margin:0">No goals yet. Open a bucket (e.g. Education) and tap "Set a goal".</p>'}
   </div>
@@ -819,6 +901,110 @@ function viewPlan(){
   </div>`;
 }
 
+function safetyCard(){
+  const em = emergencyStatus(), dp = depositStatus();
+  const emLine = !em ? `<span class="faint">No emergency bucket — choose one in Edit</span>`
+    : em.months===null ? `<span class="faint">Record some spending, or enter monthly costs in Edit</span>`
+    : `${statusPill(em.state, `${em.months.toFixed(1)} of ${em.c.months} months`)}`;
+  const dpLine = !dp.c.dpOn ? '<span class="faint">Off</span>' : !dp.groups.length ? '<span class="faint">No bank cash recorded</span>'
+    : dp.over.length ? statusPill('warn', `${dp.over.length} bank${dp.over.length>1?'s':''} over ${short(dp.c.dpLimit)}`) : statusPill('good', `All within ${short(dp.c.dpLimit)}`);
+  return `<div class="card"><div class="row between"><h2 style="margin:0">Safety checks</h2><button class="small" data-act="editSafety">Edit</button></div>
+    <div class="kv" style="margin-top:8px"><span class="k">Emergency fund</span>${emLine}</div>
+    <div class="kv"><span class="k">Deposit protection per bank</span>${dpLine}</div>
+    <button class="block" style="margin-top:10px" data-act="stressTest">📉 Stress test: what if markets fall?</button>
+  </div>`;
+}
+function editSafety(){
+  const c = safetyCfg(), auto = windowStats().livingYr/12, em = emergencyBucket(), dp = depositStatus();
+  sheet('Safety checks', `
+    <h3>Emergency fund</h3>
+    <label>Which bucket is your emergency fund?</label><select id="sfB"><option value="">${em?'Automatic ('+esc(em.name)+')':'— none —'}</option>${S.buckets.map(b=>`<option value="${b.id}" ${c.emBucket===b.id?'selected':''}>${esc(b.name)}</option>`).join('')}</select>
+    <div class="grid2"><div><label>Target (months of costs)</label><input id="sfM" type="number" inputmode="decimal" value="${c.months}"></div>
+    <div><label>Flag extra cash above (months)</label><input id="sfX" type="number" inputmode="decimal" value="${c.excessMonths}"></div></div>
+    <label>Monthly living costs (฿)</label><input id="sfC" inputmode="decimal" value="${c.monthly}" placeholder="${auto>0?'Automatic: '+fmt0.format(Math.round(auto))+' from your last 12 months':'e.g. 250,000'}">
+    <div class="faint">Leave blank to use your recorded spending automatically.</div>
+    <h3>Deposit protection</h3>
+    <label class="check"><input type="checkbox" id="sfDp" ${c.dpOn?'checked':''}><span>Warn when cash at one bank is above the limit<br><span class="faint">Thai deposit protection covers ฿1,000,000 per person per bank. Bank accounts in different people's names count separately — set the account holder in each account.</span></span></label>
+    <label>Limit per person per bank (฿)</label><input id="sfL" inputmode="decimal" value="${c.dpLimit}">
+    ${dp.groups.length?`<table style="margin-top:8px">${dp.groups.map(x=>`<tr><td>${esc(x.name)}</td><td class="num" style="${x.v>c.dpLimit?'font-weight:700':''}">${x.v>c.dpLimit?'⚠ ':''}${B(x.v)}</td></tr>`).join('')}</table>`:''}
+    <div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{
+    el.querySelector('#ok').onclick=()=>{
+      S.settings.safety = { emBucket:val(el,'sfB'), months:num(val(el,'sfM'))||6, excessMonths:Math.max(num(val(el,'sfM'))||6, num(val(el,'sfX'))||12),
+        monthly: val(el,'sfC')==='' ? '' : num(val(el,'sfC')), dpOn: el.querySelector('#sfDp').checked, dpLimit: num(val(el,'sfL'))||1000000 };
+      putSettings(); after();
+    };
+  });
+}
+
+/* Stress test: what a market fall would do to your plan (nothing is changed) */
+const SHOCK = { equity:1, crypto:1.5, property:0.5, other:0.5, bond:0.15, gold:0, cash:0 };
+function runStress(drop){
+  const goalsB = S.buckets.filter(b=>goalProjection(b));
+  const before = { total: totalValue(), su: sustainability(), goals: goalsB.map(b=>goalProjection(b).funded) };
+  const saved = S.holdings.map(h=>h.value); let after;
+  try{
+    S.holdings.forEach(h=>{ h.value = h.value * (1 - Math.min(1, drop/100 * (SHOCK[h.type] ?? 0.5))); }); bump();
+    after = { total: totalValue(), su: _sustainability(), goals: goalsB.map(b=>_goalProjection(b).funded) };
+  } finally { S.holdings.forEach((h,i)=>h.value = saved[i]); bump(); }
+  return { goalsB, before, after };
+}
+function stressTest(){
+  sheet('Stress test', `<p class="help">See what a market fall would do to your plan. Nothing is changed.</p>
+    <label>Stock markets fall by (%)</label>
+    <div class="row"><input id="stD" type="number" inputmode="decimal" value="30"><button class="small primary" id="stGo">Show</button></div>
+    <div class="chips" style="margin-top:8px">${[20,30,40,50].map(d=>`<button class="chip" data-d="${d}">−${d}%</button>`).join('')}</div>
+    <div id="stOut"></div>
+    <p class="faint" style="margin-top:12px">Assumes bonds fall 15% as much as stocks, property and "other" half as much, crypto 1.5×, and gold and cash don't change.</p>`, el=>{
+    const show = ()=>{
+      const d = Math.max(0, Math.min(90, num(val(el,'stD')))); const r = runStress(d);
+      const su = x => !x.perm.length || !S.expenses.length ? '—' : x.gap<=0 ? `${short(-x.gap)}/yr spare` : `${short(x.gap)}/yr short`;
+      const row = (k, a, b, bad) => `<tr><td>${k}</td><td class="num">${a}</td><td class="num" style="${bad?'font-weight:700':''}">${b}</td></tr>`;
+      el.querySelector('#stOut').innerHTML = `<table style="margin-top:12px"><tr><th></th><th>Now</th><th>After −${d}%</th></tr>
+        ${row('Total wealth', short(r.before.total), short(r.after.total)+` <span class="faint">(${short(r.after.total-r.before.total)})</span>`, false)}
+        ${r.goalsB.map((b,i)=>row(esc(b.name)+' goal', Math.round(Math.min(r.before.goals[i],999))+'% funded', Math.round(Math.min(r.after.goals[i],999))+'% funded', r.after.goals[i]<85)).join('')}
+        ${row('Lifestyle', su(r.before.su), su(r.after.su), r.after.su.gap>0 && r.before.su.gap<=0)}
+      </table>
+      <div class="rec" style="margin-top:10px">If this happens: <b>don't sell in a panic.</b> Your cash and emergency fund are untouched, and rebalancing will show how much to buy back into stocks while they're cheaper.</div>`;
+    };
+    el.querySelector('#stGo').onclick = show;
+    el.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{ el.querySelector('#stD').value=b.dataset.d; show(); });
+    show();
+  });
+}
+
+/* ================= Annual review ================= */
+const REVIEW_ITEMS = [
+  ['values','Update every holding\'s value', ()=>bulkUpdate()],
+  ['assume','Check return assumptions and inflation', ()=>assumeForm()],
+  ['goals','Review goals: amounts, years, glide path', ()=>go({tab:'plan'})],
+  ['mix','Review each bucket\'s target mix', ()=>go({tab:'buckets'})],
+  ['budget','Set next year\'s budget', ()=>budgetForm(nowYear()+1)],
+  ['insurance','Check insurance cover, premiums and beneficiaries', ()=>go({tab:'more',sub:'insurance'})],
+  ['fees','Check fund fees — any cheaper equivalent?', ()=>go({tab:'plan'})],
+  ['safety','Check safety settings (emergency months, bank limit)', ()=>editSafety()],
+  ['handover','Update and print the family handover', ()=>go({tab:'more',sub:'handover'})],
+  ['backup','Save a backup file', ()=>exportData()],
+  ['pass','Make sure the family passphrase is written down and both of you know it', null]
+];
+const reviewCfg = () => Object.assign({ month:1, custom:[], done:{} }, S.settings.review||{});
+const reviewStatus = () => memo('rv', ()=>{
+  const c = reviewCfg(), year = nowYear(), d = c.done[year]||{};
+  const keys = [...REVIEW_ITEMS.map(x=>x[0]), ...c.custom.map((_,i)=>'c'+i)];
+  const done = keys.filter(k=>d[k]).length;
+  return { year, done, total:keys.length, due: (new Date().getMonth()+1) >= c.month && done < keys.length && S.holdings.length>0, c, d };
+});
+function viewReview(){
+  const r = reviewStatus(), c = r.c;
+  const item = (k, label, hasGo) => `<div class="list-item" style="cursor:default"><input type="checkbox" data-rvk="${k}" ${r.d[k]?'checked':''}><div class="grow" style="white-space:normal">${esc(label)}${r.d[k]?`<div class="faint">Done ${fmtDate(r.d[k])}</div>`:''}</div>${hasGo?`<button class="small" data-rvgo="${k}">Go</button>`:''}</div>`;
+  return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Annual review ${r.year}</h1>
+  <p class="help">Once a year, check that your plan still fits your life. Tick each item when done. ${r.done} of ${r.total} done.</p>
+  ${progressBar(r.total?r.done/r.total*100:0, r.done===r.total?'var(--good)':'var(--accent)')}
+  <div class="card" style="margin-top:12px">${REVIEW_ITEMS.map(([k,l,f])=>item(k,l,!!f)).join('')}${c.custom.map((l,i)=>item('c'+i,l,false)).join('')}</div>
+  <div class="card"><div class="kv"><span class="k">Remind me from</span><select id="rvM" style="width:auto">${Array.from({length:12},(_,i)=>`<option value="${i+1}" ${c.month===i+1?'selected':''}>${DF_MONTH.format(new Date(2000,i,1)).split(' ')[0]}</option>`).join('')}</select></div>
+    <button class="block" style="margin-top:8px" data-act="reviewCustom">Add your own items</button></div>`;
+}
+function setReview(fn){ const c = reviewCfg(); fn(c); S.settings.review = c; putSettings(); save(); UI.keepScroll = true; render(); }
+
 /* ---------- More ---------- */
 function viewMore(){
   const lb = DEV.lastBackup;
@@ -834,6 +1020,7 @@ function viewMore(){
     ${item('openHandover','📋','Family handover','A printable summary for your family')}
   </div>
   <div class="card menu">
+    ${item('openReview','🗓️','Annual review', (()=>{ const r=reviewStatus(); return `${r.year}: ${r.done} of ${r.total} done`; })())}
     ${item('setBudget','🎯','Yearly budget','Set or change the budget')}
     ${item('editCats','🏷️','Expense categories','Edit the list')}
     ${item('editSources','💼','Income sources','Edit the list')}
@@ -846,7 +1033,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.2 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.4 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -910,7 +1097,8 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p>Tap the blue <b>+ Add</b> button (bottom right) → <b>Expense</b> or <b>Income</b>.</p>
   <ol><li>Type the amount.</li><li>Tap a category (or income source).</li><li>Choose which cash holding it was paid from / into.</li><li>Tap <b>Save</b>.</li></ol>
   <p>The money is taken out of (or added to) that cash holding automatically.</p>
-  <p><b>Made a mistake?</b> Go to <b>Money → History</b>, tap the entry, then <b>Delete</b>. The money goes back.</p>
+  <p><b>Made a mistake?</b> Go to <b>Money → History</b> and tap the entry to <b>edit</b> it (amount, category, account, date, note) or <b>delete</b> it. Balances update automatically.</p>
+  <p><b>Recent</b> chips at the top of the form fill in the category and account you used lately in one tap.</p>
   <p class="faint">Tip: income named "Dividends &amp; interest" counts as investment return, not as new money you earned.</p>`},
  {i:'🔄', t:'Monthly check-in (5 minutes)', b:`
   <p>Fund and stock prices change every day, but the app doesn't know them automatically. Once a month:</p>
@@ -962,6 +1150,14 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>More → Family handover</b>: a summary your family can use if something happens to you — every account, what's in it, nominees, insurance, and your written instructions (who to call, where documents are).</p>
   <ol><li>In each account, fill in <b>Nominee</b> and <b>Notes for family</b>.</li><li>Write your <b>Instructions</b>.</li><li>Tap <b>Print / save PDF</b> and keep it somewhere safe your family knows about.</li><li>Redo it every 6 months.</li></ol>
   <p class="rec">⚠️ Never write passwords or PINs in this app.</p>`},
+ {i:'🛡️', t:'Safety checks, stress test and annual review', b:`
+  <p><b>Plan → Safety checks</b> watches two things and only warns you on Home when something needs action:</p>
+  <ul><li><b>Emergency fund</b> — how many months of living costs your emergency bucket covers (target 6 by default). It also tells you when there's much more cash than needed, which could be invested.</li>
+   <li><b>Deposit protection</b> — Thai bank deposits are protected up to ฿1,000,000 per person per bank. You're warned if cash at one bank goes above that. Set each account's <b>holder</b> so accounts in different names count separately.</li></ul>
+  <p>Tap <b>Edit</b> to change the bucket, the number of months, your monthly costs (or leave it automatic), and the limit.</p>
+  <p><b>Stress test</b> shows what a market fall (e.g. −30%) would do to your wealth, goals and lifestyle check — without changing anything. Use it to make sure you could ride out a crash calmly.</p>
+  <p><b>Glide path</b> (in Edit goal): for goals like education, the bucket's target mix gradually moves to a safer mix in the years before the money is needed. Rebalancing then follows it automatically.</p>
+  <p><b>More → Annual review</b>: a yearly checklist (values, assumptions, goals, budget, insurance, fees, handover, backup, passphrase). Tick items as you go; you can add your own and choose the month it starts reminding you.</p>`},
  {i:'💾', t:'Backup, restore and changing phones', b:`
   <p>Because data lives only on this phone, you lose it if the phone is lost, reset, or Chrome's data is cleared.</p>
   <p><b>Back up:</b> <b>More → Back up now</b> → choose <b>Drive</b> (Google Drive) and save. Do it every week or two. The app reminds you after 14 days.</p>
@@ -991,7 +1187,7 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
    <li><b>Works offline</b> — changes are kept and sync when you're back online. If you both add something at the same time, nothing is lost.</li>
   </ul>
   <p><b>Joining on a new phone:</b> install the app → <b>More → Family sync → Join</b> → paste the setup code (from the first phone: More → Family sync → Copy setup code) → sign in → enter the family passphrase.</p>
-  <p>The <b>☁ Synced</b> badge at the top of Home shows the status. Tap it for details.</p>
+  <p>The <b>☁ Synced</b> badge at the top of Home shows the status. Tap it for details. In More → Family sync you can set <b>your name</b>, so entries show who added them, and Money → History can be filtered by person.</p>
   <p class="rec">⚠️ If both of you forget the passphrase, the cloud data can't be recovered. Keep it written down, and keep making backup files now and then.</p>`},
  {i:'🔧', t:'Behind the scenes — GitHub & Firebase', b:`
   <p>Two free services run the app. You only need these if something must be changed or fixed.</p>
@@ -1047,7 +1243,8 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p>แตะปุ่มสีฟ้า <b>+ Add</b> (มุมขวาล่าง) → <b>Expense (รายจ่าย)</b> หรือ <b>Income (รายได้)</b></p>
   <ol><li>พิมพ์จำนวนเงิน</li><li>แตะหมวดหมู่ (หรือแหล่งรายได้)</li><li>เลือกว่าจ่ายจาก / รับเข้า บัญชีเงินสดไหน</li><li>แตะ <b>Save</b></li></ol>
   <p>แอปจะหักหรือเพิ่มเงินในบัญชีเงินสดนั้นให้อัตโนมัติ</p>
-  <p><b>บันทึกผิด?</b> ไปที่ <b>Money → History</b> แตะรายการนั้น แล้วกด <b>Delete</b> เงินจะคืนกลับ</p>
+  <p><b>บันทึกผิด?</b> ไปที่ <b>Money → History</b> แตะรายการนั้นเพื่อ <b>แก้ไข</b> (จำนวนเงิน หมวดหมู่ บัญชี วันที่ โน้ต) หรือ <b>ลบ</b> ยอดเงินจะปรับให้อัตโนมัติ</p>
+  <p>ปุ่ม <b>Recent</b> ด้านบนของฟอร์ม ช่วยเลือกหมวดหมู่และบัญชีที่ใช้ล่าสุดได้ในแตะเดียว</p>
   <p class="faint">เคล็ดลับ: รายได้ประเภท "Dividends &amp; interest (เงินปันผลและดอกเบี้ย)" นับเป็นผลตอบแทนจากการลงทุน ไม่ใช่รายได้ใหม่</p>`},
  {i:'🔄', t:'อัปเดตมูลค่ารายเดือน (5 นาที)', b:`
   <p>ราคากองทุนและหุ้นเปลี่ยนทุกวัน แต่แอปไม่รู้เองอัตโนมัติ เดือนละครั้งให้:</p>
@@ -1099,6 +1296,14 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>More → Family handover</b>: สรุปให้ครอบครัวใช้หากเกิดอะไรขึ้นกับเรา — ทุกบัญชี มีอะไรอยู่ ผู้รับผลประโยชน์ ประกัน และคำแนะนำที่เราเขียนไว้ (ติดต่อใคร เอกสารเก็บไว้ที่ไหน)</p>
   <ol><li>ในแต่ละบัญชี กรอก <b>Nominee</b> และ <b>Notes for family</b></li><li>เขียน <b>Instructions</b></li><li>แตะ <b>Print / save PDF</b> แล้วเก็บไว้ในที่ที่ครอบครัวรู้</li><li>ทำใหม่ทุก 6 เดือน</li></ol>
   <p class="rec">⚠️ ห้ามจดรหัสผ่านหรือ PIN ไว้ในแอปนี้</p>`},
+ {i:'🛡️', t:'ตรวจความปลอดภัย ทดสอบภาวะวิกฤต และทบทวนประจำปี', b:`
+  <p><b>Plan → Safety checks</b> ดูแลสองเรื่อง และจะเตือนที่หน้า Home เฉพาะเมื่อต้องจัดการ:</p>
+  <ul><li><b>เงินฉุกเฉิน</b> — กระเป๋าเงินฉุกเฉินพอใช้กี่เดือน (ค่าเริ่มต้นเป้า 6 เดือน) และบอกเมื่อมีเงินสดเกินจำเป็นมากที่นำไปลงทุนได้</li>
+   <li><b>การคุ้มครองเงินฝาก</b> — เงินฝากในไทยคุ้มครองสูงสุด ฿1,000,000 ต่อคนต่อธนาคาร แอปจะเตือนถ้าเงินสดในธนาคารเดียวเกินวงเงิน ตั้ง <b>ชื่อเจ้าของบัญชี</b> ในแต่ละบัญชี เพื่อให้บัญชีต่างชื่อนับแยกกัน</li></ul>
+  <p>แตะ <b>Edit</b> เพื่อเปลี่ยนกระเป๋า จำนวนเดือน ค่าใช้จ่ายต่อเดือน (หรือปล่อยให้คำนวณอัตโนมัติ) และวงเงิน</p>
+  <p><b>Stress test</b> แสดงว่าถ้าตลาดตก (เช่น −30%) จะกระทบความมั่งคั่ง เป้าหมาย และความยั่งยืนอย่างไร โดยไม่เปลี่ยนข้อมูลจริง ใช้เพื่อมั่นใจว่ารับมือวิกฤตได้อย่างใจเย็น</p>
+  <p><b>Glide path</b> (ใน Edit goal): สำหรับเป้าหมายอย่างการศึกษา สัดส่วนเป้าหมายจะค่อย ๆ ปรับเป็นแบบปลอดภัยขึ้นในช่วงปีก่อนต้องใช้เงิน และการปรับสมดุลจะตามให้อัตโนมัติ</p>
+  <p><b>More → Annual review</b>: รายการตรวจประจำปี (มูลค่า สมมติฐาน เป้าหมาย งบประมาณ ประกัน ค่าธรรมเนียม เอกสารส่งต่อ ไฟล์สำรอง รหัสผ่านครอบครัว) ติ๊กเมื่อทำเสร็จ เพิ่มรายการเองได้ และเลือกเดือนที่เริ่มเตือนได้</p>`},
  {i:'💾', t:'สำรองข้อมูล กู้คืน และเปลี่ยนโทรศัพท์', b:`
   <p>ข้อมูลอยู่ในโทรศัพท์เครื่องนี้เท่านั้น ถ้าเครื่องหาย ถูกรีเซ็ต หรือล้างข้อมูล Chrome ข้อมูลจะหายหมด</p>
   <p><b>สำรอง:</b> <b>More → Back up now</b> → เลือก <b>Drive</b> (Google Drive) แล้วบันทึก ทำทุก 1–2 สัปดาห์ แอปจะเตือนเมื่อครบ 14 วัน</p>
@@ -1128,7 +1333,7 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
    <li><b>ใช้ได้แม้ไม่มีเน็ต</b> — ข้อมูลจะเก็บไว้และซิงค์เมื่อกลับมาออนไลน์ ถ้าบันทึกพร้อมกันสองเครื่อง ข้อมูลจะไม่หาย</li>
   </ul>
   <p><b>เพิ่มโทรศัพท์เครื่องใหม่:</b> ติดตั้งแอป → <b>More → Family sync → Join</b> → วาง setup code (จากเครื่องแรก: More → Family sync → Copy setup code) → ลงชื่อเข้าใช้ → ใส่รหัสผ่านครอบครัว</p>
-  <p>ป้าย <b>☁ Synced</b> ที่ด้านบนหน้า Home แสดงสถานะ แตะเพื่อดูรายละเอียด</p>
+  <p>ป้าย <b>☁ Synced</b> ที่ด้านบนหน้า Home แสดงสถานะ แตะเพื่อดูรายละเอียด ที่ More → Family sync ตั้ง <b>ชื่อของเรา</b> ได้ เพื่อให้รายการแสดงว่าใครบันทึก และกรองประวัติใน Money → History ตามคนได้</p>
   <p class="rec">⚠️ ถ้าลืมรหัสผ่านครอบครัวทั้งสองคน ข้อมูลบนคลาวด์จะกู้คืนไม่ได้ จดไว้ให้ดี และสำรองข้อมูลเป็นไฟล์เป็นระยะ</p>`},
  {i:'🔧', t:'เบื้องหลัง — GitHub และ Firebase', b:`
   <p>แอปทำงานด้วยบริการฟรีสองอย่าง ต้องใช้เฉพาะเมื่อจะแก้ไขหรืออัปเดต</p>
@@ -1320,7 +1525,7 @@ const Sync = {
         }
         if(docs.length < 300) break;
       }
-      DEV.lastTsUs = maxUs; saveDev(); this.ok();
+      if(maxUs !== (DEV.lastTsUs||0)){ DEV.lastTsUs = maxUs; saveDev(); } this.ok();
       if(changed){ recompute(); persistLocal(); scheduleRender(); }
     }catch(e){ this.fail(e); }
     this.polling = false;
@@ -1382,7 +1587,9 @@ function viewSync(){
     return head + `<div class="card"><div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${ok?'var(--good)':Sync.state==='error'?'var(--crit)':'var(--warn)'}">${ok?'✓':'!'}</span><div><b>${ok?'Sync is on':Sync.state==='error'?'Sync problem':'Waiting for connection'}</b><div class="faint">${ok?'Changes on either phone appear on the other within about 5 seconds while the app is open.':esc(Sync.err||'Changes are saved on this phone and will sync when back online.')}</div></div></div>
       <div class="kv"><span class="k">Signed in as</span><b>${esc(DEV.email||Sync.user?.email||'')}</b></div>
       <div class="kv"><span class="k">Firebase project</span><b>${esc(DEV.cfg?.projectId||'')}</b></div>
-      <div class="kv"><span class="k">Encryption</span><b>🔒 Family passphrase</b></div></div>
+      <div class="kv"><span class="k">Encryption</span><b>🔒 Family passphrase</b></div>
+      <label>Your name on this phone (shown next to entries you add)</label>
+      <div class="row"><input id="myName" value="${esc(myName())}" placeholder="e.g. Tong"><button class="small" data-act="saveName">Save</button></div></div>
     <div class="card"><h2>Add another phone</h2><p class="help">On the other phone: install the app, open More → Family sync → <b>Join</b>, and paste this setup code. Send it by LINE or similar — it's not secret on its own (it doesn't contain passwords or the passphrase).</p>
       <textarea readonly rows="3" id="scode" style="font-size:12px">${esc(setupCode())}</textarea>
       <button class="primary block" style="margin-top:8px" data-act="copyCode">Copy setup code</button></div>
@@ -1477,6 +1684,7 @@ const SYNC_ACT = {
       Sync.listen(); UI.syncStep = null; go({tab:'home'}); toast('Unlocked — downloading family data…');
     }catch(e){ busy(btn,false); err.innerHTML = e.message==='WRONG_PASS' ? 'Wrong passphrase. Check capitals and spaces.' : errHTML(e,'db'); }
   },
+  saveName: ()=>{ const v=document.getElementById('myName').value.trim(); DEV.name=v; saveDev(); toast(v?`Entries you add will show “${v}”`:'Name cleared'); },
   copyCode: async ()=>{ const t = setupCode(); try{ await navigator.clipboard.writeText(t); toast('Setup code copied'); }catch(e){ const el=document.getElementById('scode'); el.focus(); el.select(); toast('Long-press the code and choose Copy'); } },
   syncStop: ()=>confirmSheet('Stop syncing on this phone? It keeps its current copy of the data. You can join again later with the setup code and passphrase.','Stop syncing', async ()=>{ await Sync.stop(); UI.syncStep=null; render(); toast('Sync stopped on this phone'); })
 };
@@ -1495,27 +1703,40 @@ function bindView(){
   on('[data-inc]', b=>entrySheet('inc', b.dataset.inc));
   on('[data-go]', b=>go({tab:b.dataset.go}));
   on('[data-back]', b=>{ if(history.state && history.length>1) history.back(); else go(JSON.parse(b.dataset.back)); });
+  app.querySelectorAll('[data-rvk]').forEach(cb=>cb.onchange=()=>setReview(c=>{ const y=nowYear(); c.done[y]=c.done[y]||{}; if(cb.checked) c.done[y][cb.dataset.rvk]=today(); else delete c.done[y][cb.dataset.rvk]; }));
+  on('[data-rvgo]', b=>{ const it = REVIEW_ITEMS.find(x=>x[0]===b.dataset.rvgo); if(it && it[2]) it[2](); });
+  const rvM = document.getElementById('rvM'); if(rvM) rvM.onchange = ()=>setReview(c=>{ c.month = +rvM.value; });
+  on('[data-by]', b=>{ UI.byFilter=b.dataset.by; UI.keepScroll=true; render(); });
   on('[data-mv]', b=>{ UI.moneyView=b.dataset.mv; UI.openMonth=null; UI.keepScroll=true; render(); });
   on('[data-month]', b=>{ UI.openMonth = b.dataset.open==='1' ? '__none__' : b.dataset.month; UI.keepScroll=true; render(); });
   on('[data-alert]', b=>UI._alerts[+b.dataset.alert].go());
   on('[data-act]', b=>(ACT[b.dataset.act]||SYNC_ACT[b.dataset.act])(b.dataset.id, b));
   on('[data-sstep]', b=>{ UI.syncStep=b.dataset.sstep; render(); });
   const ys = document.getElementById('yearSel'); if(ys) ys.onchange=()=>{UI.spendYear=+ys.value; UI.openMonth=null; render();};
-  const hc = document.getElementById('homeChart'); if(hc) lineChart(hc, seriesFor(UI.chartBucket, UI.range));
-  const bc = document.getElementById('bucketChart'); if(bc) lineChart(bc, seriesFor(UI.bucket, UI.range), {h:160});
-  const gc = document.getElementById('goalChart'); if(gc) lineChart(gc, [{name:'Projected balance', color:'var(--accent)', pts:UI._goalPts}], {h:150, yearly:true, label:'Projected goal balance'});
+  requestAnimationFrame(()=>{
+    const hc = document.getElementById('homeChart'); if(hc) lineChart(hc, seriesFor(UI.chartBucket, UI.range));
+    const bc = document.getElementById('bucketChart'); if(bc) lineChart(bc, seriesFor(UI.bucket, UI.range), {h:160});
+    const gc = document.getElementById('goalChart'); if(gc) lineChart(gc, [{name:'Projected balance', color:'var(--accent)', pts:UI._goalPts}], {h:150, yearly:true, label:'Projected goal balance'});
+  });
   const f = document.getElementById('importFile'); if(f) f.onchange = importFile;
   on('[data-lang]', b=>{ DEV.guideLang=b.dataset.lang; saveDev(); UI.keepScroll=true; render(); });
   app.querySelectorAll('details[data-gi]').forEach(d=>d.addEventListener('toggle',()=>{ if(d.open){ UI.guideOpen=+d.dataset.gi; app.querySelectorAll('details[data-gi]').forEach(o=>{ if(o!==d) o.open=false; }); } }));
 }
-document.getElementById('tabs').onclick = e => { const b=e.target.closest('[data-tab]'); if(!b) return; UI.openMonth=null; go({tab:b.dataset.tab}); };
+document.getElementById('tabs').onclick = e => {
+  const b = e.target.closest('[data-tab]'); if(!b) return;
+  if(UI.tab===b.dataset.tab && !UI.bucket && !UI.sub){ window.scrollTo({top:0, behavior:'smooth'}); return; }   // tapping the current tab scrolls to top
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on', x===b));                       // light the tab immediately
+  UI.openMonth = null; requestAnimationFrame(()=>setTimeout(()=>go({tab:b.dataset.tab}), 0));                   // then draw the screen
+};
 document.getElementById('fab').onclick = () => quickAdd();
 
 const ACT = {
   addAccount: ()=>editAccount(null), addBucket: ()=>editBucket(null), editBucket: id=>editBucket(id),
   addHolding: id=>editHolding(null, id), addExpense: ()=>expenseForm(), addIncome: ()=>incomeForm(),
   addPolicy: ()=>editPolicy(null), editGoal: id=>editGoal(id),
-  setBudget: ()=>budgetForm(), editCats: ()=>listForm('categories','Expense categories'), editSources: ()=>listForm('sources','Income sources'),
+  setBudget: ()=>budgetForm(),
+  editSafety: ()=>editSafety(), stressTest: ()=>stressTest(), openReview: ()=>go({tab:'more',sub:'review'}),
+  reviewCustom: ()=>{ const c = reviewCfg(); sheet('Your own review items', `<label>One per line</label><textarea id="rc" rows="8" placeholder="e.g. Check the kids' savings accounts">${esc(c.custom.join('\n'))}</textarea><div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{ el.querySelector('#ok').onclick=()=>{ closeSheet(); setReview(x=>{ x.custom = val(el,'rc').split('\n').map(t=>t.trim()).filter(Boolean); }); }; }); }, editCats: ()=>listForm('categories','Expense categories'), editSources: ()=>listForm('sources','Income sources'),
   editAssume: ()=>assumeForm(), editHandover: ()=>handoverForm(),
   openAccounts: ()=>go({tab:'more',sub:'accounts'}), openGuide: ()=>go({tab:'more',sub:'guide'}), openInsurance: ()=>go({tab:'more',sub:'insurance'}), openHandover: ()=>go({tab:'more',sub:'handover'}),
   copyUrl: async ()=>{ try{ await navigator.clipboard.writeText(appUrl()); toast('Address copied'); }catch(e){ toast(appUrl()); } },
@@ -1564,12 +1785,14 @@ function editAccount(id){
     <label>Account name</label><input id="an" value="${esc(a.name)}" placeholder="e.g. KBank savings, InnovestX funds">
     <label>Bank / provider</label><input id="ai" value="${esc(a.institution)}" placeholder="e.g. Kasikorn, InnovestX">
     <label>Kind</label><select id="ak">${[['bank','Bank account'],['fund','Fund account'],['broker','Stock broker'],['crypto','Crypto exchange'],['insurance','Insurance / pension'],['other','Other']].map(([k,n])=>`<option value="${k}" ${a.kind===k?'selected':''}>${n}</option>`).join('')}</select>
+    <label>Account holder (optional)</label><input id="ahold" value="${esc(a.holder||'')}" placeholder="e.g. Tong, Namthip, Joint">
+    <div class="faint">Used for the deposit protection check: each person is covered separately at each bank.</div>
     <h3>For your family handover (optional)</h3>
     <label>Nominee / beneficiary</label><input id="anom" value="${esc(a.nominee||'')}" placeholder="e.g. Namthip (wife)">
     <label>Notes for family</label><textarea id="anotes" rows="3" placeholder="Branch, relationship manager's phone, last 4 digits of account no. — never passwords">${esc(a.notes||'')}</textarea>
     <div class="actions">${id?'<button class="danger" id="del">Delete</button>':''}<button class="primary" id="ok">Save</button></div>`, el=>{
     el.querySelector('#ok').onclick=()=>{ const name=val(el,'an'); if(!name) return toast('Give it a name');
-      const data={name,institution:val(el,'ai'),kind:val(el,'ak'),nominee:val(el,'anom'),notes:val(el,'anotes')};
+      const data={name,institution:val(el,'ai'),kind:val(el,'ak'),holder:val(el,'ahold'),nominee:val(el,'anom'),notes:val(el,'anotes')};
       if(id){ Object.assign(a,data); put('accounts', a); } else put('accounts', {id:uid(),...data});
       after(); };
     const d=el.querySelector('#del'); if(d) d.onclick=()=>{ if(S.holdings.some(h=>h.accountId===id)) return toast('Move or delete its holdings first'); drop('accounts', id); after(); };
@@ -1608,6 +1831,7 @@ function editBucket(id){
 function editGoal(id){
   const b = bkt(id); const g = b.goal || {kind:'withdrawals', rows:[{from:'',to:'',amt:''}], target:{amt:'',year:''}, contrib:{amt:'',until:''}};
   let kind = g.kind || 'withdrawals';
+  const gl = g.glide || { on:false, years:5, mix:{cash:20, bond:60, equity:20} };
   const rowHTML = r => `<div class="goalrow"><div><label>From year</label><input data-f="from" inputmode="numeric" value="${esc(r.from)}" placeholder="${nowYear()+5}"></div><div><label>To year</label><input data-f="to" inputmode="numeric" value="${esc(r.to)}" placeholder="${nowYear()+10}"></div><div><label>฿ per year</label><input data-f="amt" inputmode="decimal" value="${esc(r.amt)}" placeholder="600,000"></div><button class="x rm" aria-label="Remove">✕</button></div>`;
   sheet(`Goal · ${esc(b.name)}`, `
     <div class="segctl"><button data-k="withdrawals" class="${kind==='withdrawals'?'on':''}">Planned spending</button><button data-k="target" class="${kind==='target'?'on':''}">Target amount</button></div>
@@ -1624,7 +1848,19 @@ function editGoal(id){
     <div class="grid2"><div><label>฿ per year</label><input id="cam" inputmode="decimal" value="${esc(g.contrib?.amt||'')}" placeholder="0"></div><div><label>Until year</label><input id="cun" inputmode="numeric" value="${esc(g.contrib?.until||'')}" placeholder="${nowYear()+8}"></div></div>
     <label>Costs rise by (% per year)</label><input id="ggr" type="number" inputmode="decimal" value="${g.growth ?? ''}" placeholder="${S.settings.inflation} (inflation)">
     <div class="faint">Education costs often rise faster than general inflation — 4–5% is a cautious choice.</div>
+    <h3>Lower the risk as the money is needed (optional)</h3>
+    <label class="check"><input type="checkbox" id="glOn" ${gl.on?'checked':''}><span>Shift gradually to a safer mix before the first withdrawal<br><span class="faint">So a market fall just before the money is needed can't hurt the goal.</span></span></label>
+    <div id="glBox" style="${gl.on?'':'display:none'}">
+      <label>Start shifting this many years before</label><input id="glYrs" type="number" inputmode="numeric" value="${gl.years||5}">
+      <label>Safer mix to reach by then (must add up to 100%)</label>
+      <div class="grid2">${['cash','bond','equity','gold'].map(k=>`<div><label><span class="dot" style="background:${tColor(k)};width:8px;height:8px"></span> ${TYPE_NAME[k]}</label><input type="number" inputmode="decimal" data-gm="${k}" value="${gl.mix?.[k]??''}" placeholder="0"></div>`).join('')}</div>
+      <div id="glSum" class="faint" style="margin-top:6px"></div>
+    </div>
     <div class="actions">${b.goal?'<button class="danger" id="del">Remove goal</button>':''}<button class="primary" id="ok">Save goal</button></div>`, el=>{
+    const glIns = [...el.querySelectorAll('[data-gm]')];
+    const glUpd = ()=>{ const t=sum(glIns.map(i=>num(i.value))); el.querySelector('#glSum').innerHTML = `Total: <b style="color:${t===100?'var(--good)':'var(--crit)'}">${t}%</b>`; };
+    glIns.forEach(i=>i.oninput=glUpd); glUpd();
+    el.querySelector('#glOn').onchange = e => { el.querySelector('#glBox').style.display = e.target.checked ? '' : 'none'; };
     el.querySelectorAll('[data-k]').forEach(btn=>btn.onclick=()=>{ kind=btn.dataset.k; el.querySelectorAll('[data-k]').forEach(x=>x.classList.toggle('on',x===btn)); el.querySelector('#gw').style.display=kind==='withdrawals'?'':'none'; el.querySelector('#gt').style.display=kind==='target'?'':'none'; });
     const bindRm = ()=>el.querySelectorAll('.rm').forEach(x=>x.onclick=()=>{ if(el.querySelectorAll('.goalrow').length>1) x.closest('.goalrow').remove(); });
     bindRm();
@@ -1635,6 +1871,10 @@ function editGoal(id){
       if(kind==='withdrawals' && !rows.length) return toast('Add at least one period with a year and amount');
       if(kind==='target' && !(ng.target.amt && ng.target.year)) return toast('Enter a target amount and year');
       if(ng.contrib.amt && !ng.contrib.until) ng.contrib.until = kind==='target'? ng.target.year : Math.max(...rows.map(r=>r.to||r.from));
+      const glMix = {}; glIns.forEach(i=>{ const v=num(i.value); if(v>0) glMix[i.dataset.gm]=v; });
+      ng.glide = { on: el.querySelector('#glOn').checked, years: Math.max(1, num(val(el,'glYrs'))||5), mix: glMix };
+      if(ng.glide.on && sum(Object.values(glMix))!==100) return toast('The safer mix must add up to 100%');
+      if(ng.glide.on && tsumOf(b.targets)!==100) return toast('Set this bucket\'s target mix first (Edit bucket)');
       b.goal = ng; put('buckets', b); after();
     };
     const d=el.querySelector('#del'); if(d) d.onclick=()=>{ b.goal=null; put('buckets', b); after(); };
@@ -1758,48 +1998,52 @@ function bulkUpdate(){
   });
 }
 
-function moneyForm(kind){
-  const isExp = kind==='exp'; const cash = cashHoldings();
+function moneyForm(kind, rec){
+  const isExp = kind==='exp'; const cash = cashHoldings(); const editing = !!rec;
   const list = isExp ? S.settings.categories : S.settings.sources;
-  const lastH = isExp ? DEV.lastExpenseHolding : DEV.lastIncomeHolding;
-  sheet(isExp?'Record expense':'Record income', `
-    <input id="amt" class="big-input" inputmode="decimal" placeholder="฿0">
-    <label>${isExp?'Category':'Source'}</label><div class="cat-grid">${list.map((c,i)=>`<button class="chip ${i===0?'on':''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}</div>
-    <label>${isExp?'Paid from':'Paid into'}</label><select id="hid">${cash.map(h=>`<option value="${h.id}" ${h.id===lastH?'selected':''}>${esc(holdingLabel(h))}</option>`).join('')}<option value="" ${!cash.length?'selected':''}>Not a tracked account</option></select>
-    <div class="grid2"><div><label>Date</label><input id="dt" type="date" value="${today()}"></div><div><label>Note</label><input id="nt" placeholder="optional"></div></div>
+  const curCat = editing ? (isExp?rec.cat:rec.src) : list[0];
+  const cats = list.includes(curCat) ? list : [curCat, ...list];
+  const lastH = editing ? rec.hid : (isExp ? DEV.lastExpenseHolding : DEV.lastIncomeHolding);
+  // recent picks: the last few different category + account combinations
+  const recent = []; if(!editing) for(const e of [...(isExp?S.expenses:S.income)].sort((a,b)=>(b.ct||b.at||0)-(a.ct||a.at||0))){
+    const c = isExp?e.cat:e.src; if(!list.includes(c) || (e.hid && !hld(e.hid))) continue;
+    if(!recent.some(r=>r.c===c && r.h===e.hid)) recent.push({c, h:e.hid||''}); if(recent.length>=4) break; }
+  sheet(editing ? (isExp?'Edit expense':'Edit income') : (isExp?'Record expense':'Record income'), `
+    <input id="amt" class="big-input" inputmode="decimal" placeholder="฿0" value="${editing?rec.amt:''}">
+    ${recent.length?`<label>Recent</label><div class="chips">${recent.map((r,i)=>`<button class="chip" data-rec="${i}">${esc(r.c)}${r.h?' · '+esc(hld(r.h).name):''}</button>`).join('')}</div>`:''}
+    <label>${isExp?'Category':'Source'}</label><div class="cat-grid">${cats.map(c=>`<button class="chip ${c===curCat?'on':''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}</div>
+    <label>${isExp?'Paid from':'Paid into'}</label><select id="hid">${cash.map(h=>`<option value="${h.id}" ${h.id===lastH?'selected':''}>${esc(holdingLabel(h))}</option>`).join('')}<option value="" ${!cash.length||(editing&&!rec.hid)?'selected':''}>Not a tracked account</option></select>
+    <div class="grid2"><div><label>Date</label><input id="dt" type="date" value="${editing?rec.date:today()}"></div><div><label>Note</label><input id="nt" placeholder="optional" value="${editing?esc(rec.note||''):''}"></div></div>
     <div id="bwarn"></div>
-    <div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{
-    let cat = list[0];
-    el.querySelectorAll('[data-cat]').forEach(b=>b.onclick=()=>{ el.querySelectorAll('[data-cat]').forEach(x=>x.classList.remove('on')); b.classList.add('on'); cat=b.dataset.cat; });
-    const amtIn = el.querySelector('#amt'); setTimeout(()=>amtIn.focus(),80);
-    if(isExp) amtIn.oninput = ()=>{ const y=+(val(el,'dt')||today()).slice(0,4); const bs=budgetStatus(y); const a=num(amtIn.value); el.querySelector('#bwarn').innerHTML = bs.budget && bs.spent+a>bs.budget ? `<div class="rec" style="margin-top:10px">⚠ This takes you <b>${B(bs.spent+a-bs.budget)}</b> over your ${y} budget.</div>`:''; };
+    <div class="actions">${editing?'<button class="danger" id="del">Delete</button>':''}<button class="primary" id="ok">Save</button></div>`, el=>{
+    let cat = curCat;
+    const pick = c => { cat=c; el.querySelectorAll('[data-cat]').forEach(x=>x.classList.toggle('on', x.dataset.cat===c)); };
+    el.querySelectorAll('[data-cat]').forEach(b=>b.onclick=()=>pick(b.dataset.cat));
+    el.querySelectorAll('[data-rec]').forEach(b=>b.onclick=()=>{ const r=recent[+b.dataset.rec]; pick(r.c); el.querySelector('#hid').value=r.h; el.querySelectorAll('[data-rec]').forEach(x=>x.classList.toggle('on', x===b)); });
+    const amtIn = el.querySelector('#amt'); if(!editing) setTimeout(()=>amtIn.focus(),80);
+    if(isExp) amtIn.oninput = ()=>{ const y=+(val(el,'dt')||today()).slice(0,4); const bs=budgetStatus(y); const a=num(amtIn.value)-(editing&&rec.date.startsWith(String(y))?rec.amt:0); el.querySelector('#bwarn').innerHTML = bs.budget && bs.spent+a>bs.budget ? `<div class="rec" style="margin-top:10px">⚠ This takes you <b>${B(bs.spent+a-bs.budget)}</b> over your ${y} budget.</div>`:''; };
     el.querySelector('#ok').onclick=()=>{
       const amt=num(amtIn.value); if(amt<=0) return toast('Enter an amount');
       const hid=val(el,'hid')||null, date=val(el,'dt')||today();
       let d=[], f=[];
       if(hid){ const h=hld(hid); const dv = isExp? -amt : amt; d=[{h:hid,v:dv,c:dv}];
         if(isExp || cat!==RETURN_SOURCE) f=[{b:h.bucketId,a:dv}];   // dividends/interest = investment return, not new money
-        if(isExp) DEV.lastExpenseHolding=hid; else DEV.lastIncomeHolding=hid; saveDev(); }
-      if(isExp) put('expenses', {date,amt,cat,hid,note:val(el,'nt'),d,f});
-      else put('income', {date,amt,src:cat,hid,note:val(el,'nt'),d,f});
+        if(!editing){ if(isExp) DEV.lastExpenseHolding=hid; else DEV.lastIncomeHolding=hid; saveDev(); } }
+      const data = isExp ? {date,amt,cat,hid,note:val(el,'nt'),d,f} : {date,amt,src:cat,hid,note:val(el,'nt'),d,f};
+      if(editing){ if(rec.legacy){ delete data.d; delete data.f; } Object.assign(rec, data); put(isExp?'expenses':'income', rec); }
+      else put(isExp?'expenses':'income', data);
       after();
-      if(isExp){ const bs=budgetStatus(+date.slice(0,4)); toast(bs.budget? `Saved · ${B(Math.max(0,bs.remaining))} left in ${date.slice(0,4)} budget` : 'Saved'); } else toast('Saved');
+      if(editing) toast('Updated');
+      else if(isExp){ const bs=budgetStatus(+date.slice(0,4)); toast(bs.budget? `Saved · ${B(Math.max(0,bs.remaining))} left in ${date.slice(0,4)} budget` : 'Saved'); } else toast('Saved');
     };
+    const del = el.querySelector('#del'); if(del) del.onclick=()=>confirmSheet(`Delete this ${isExp?'expense':'income'} (${B(rec.amt,true)})? ${rec.legacy ? '' : isExp?'The money goes back into the account it came from.':'The money is taken back out of the account.'}`, 'Delete', ()=>{ drop(isExp?'expenses':'income', rec.id); after(); toast('Deleted'); });
   });
 }
 const expenseForm = () => moneyForm('exp');
 const incomeForm = () => moneyForm('inc');
 function entrySheet(kind, id){
-  const isExp = kind==='exp'; const arr = isExp? S.expenses : S.income;
-  const e = arr.find(x=>x.id===id); const h=hld(e.hid);
-  sheet(`${esc(isExp?e.cat:e.src)} · ${B(e.amt,true)}`, `<div class="faint">${fmtDate(e.date)} · ${esc(h?h.name:'Not a tracked account')}${e.note?' · '+esc(e.note):''}</div>
-    <div class="actions"><button class="danger" id="del">Delete</button></div>
-    <div class="faint" style="margin-top:6px">${e.legacy ? 'Recorded before v2 — deleting removes the record only; correct the balance by hand if needed.' : isExp?'Deleting puts the money back into the account it came from.':'Deleting takes the money back out of the account it went into.'}</div>`, el=>{
-    el.querySelector('#del').onclick=()=>{
-      drop(isExp?'expenses':'income', id);
-      after(); toast('Deleted');
-    };
-  });
+  const arr = kind==='exp' ? S.expenses : S.income;
+  const e = arr.find(x=>x.id===id); if(e) moneyForm(kind, e);
 }
 
 function editPolicy(id){
@@ -1818,8 +2062,8 @@ function editPolicy(id){
     const d=el.querySelector('#del'); if(d) d.onclick=()=>{ drop('policies', id); after(); };
   });
 }
-function budgetForm(){
-  const y = UI.tab==='money'? UI.spendYear : nowYear();
+function budgetForm(yr){
+  const y = yr || (UI.tab==='money'? UI.spendYear : nowYear());
   sheet('Yearly budget', `
     <label>Year</label><input id="by" type="number" value="${y}">
     <label>Budget for the year (฿)</label><input id="ba" class="big-input" inputmode="decimal" value="${S.settings.budgets[y]||''}" placeholder="e.g. 3,000,000">
@@ -1858,7 +2102,7 @@ function handoverForm(){
 
 /* ================= Backup ================= */
 async function exportData(){
-  DEV.lastBackup = today(); saveDev();
+  DEV.lastBackup = today(); saveDev(); bump();
   const json = JSON.stringify(S);
   const name = `mywealth-backup-${today()}.json`;
   const file = new File([json], name, {type:'application/json'});
@@ -1901,7 +2145,7 @@ function loadDemo(){
   const Bk = n=>{ const b={id:uid(),created:s0,threshold:5,reviewMonths:6,moveTrigger:10,permanent:false,...n}; S.buckets.push(b); return b; };
   const em=Bk({name:'Emergency',purpose:'6 months of family expenses',targets:{cash:100}});
   const ed=Bk({name:'Education',purpose:'School and university for the kids',targets:{cash:20,bond:40,equity:40},
-    goal:{kind:'withdrawals',rows:[{from:nowYear()+8,to:nowYear()+13,amt:600000},{from:nowYear()+14,to:nowYear()+17,amt:3000000}],contrib:{amt:300000,until:nowYear()+12},growth:4}});
+    goal:{kind:'withdrawals',rows:[{from:nowYear()+8,to:nowYear()+13,amt:600000},{from:nowYear()+14,to:nowYear()+17,amt:3000000}],contrib:{amt:300000,until:nowYear()+12},growth:4,glide:{on:true,years:5,mix:{cash:20,bond:60,equity:20}}}});
   const gr=Bk({name:'Growth',purpose:'Perpetual capital — never spend the principal',targets:{cash:10,equity:70,bond:10,gold:10},permanent:true});
   const H = n=>{ const h={id:uid(),updated:today(),locked:false,ter:0,...n}; S.holdings.push(h); return h; };
   H({name:'Emergency savings',type:'cash',accountId:kb,bucketId:em.id,value:1200000,cost:1200000});
