@@ -147,6 +147,8 @@ th{color:var(--text-3);font-weight:500;border-top:0}
   .card{border:1px solid #bbb;break-inside:avoid}
   main{max-width:none}
 }
+#lock{position:fixed;inset:0;background:var(--bg);z-index:60;display:flex;align-items:center;justify-content:center;padding:24px}
+#lock .lockbox{width:100%;max-width:340px;text-align:center}
 </style>
 </head>
 <body>
@@ -282,10 +284,14 @@ const daysBetween = (a,b) => Math.round((parseD(b)-parseD(a))/864e5);
 const esc = s => String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt0 = new Intl.NumberFormat('th-TH',{maximumFractionDigits:0});
 const fmt2 = new Intl.NumberFormat('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});
-const B = (n,dec) => (n<0?'−':'')+'฿'+(dec?fmt2:fmt0).format(Math.abs(n||0));
+// Money: B(n) shows satang only when there are any (฿1,234.50 / ฿1,500,000); B(n,true) always shows them;
+// B(n,'r') rounds to whole baht — used for estimates and projections, where satang would be false precision.
+const B = (n, mode) => { const a = Math.abs(n||0), c = Math.round(a*100);
+  const f = mode==='r' ? fmt0 : (mode===true || c%100!==0) ? fmt2 : fmt0;
+  return (n<0 && (mode==='r' ? Math.round(a)>0 : c>0) ? '−' : '') + '฿' + f.format(mode==='r' ? Math.round(a) : c/100); };
 const pct = (n,d=1) => (isFinite(n)? n.toFixed(d):'0')+'%';
 const sgn = n => n>0?'+':'';
-function short(n){ const a=Math.abs(n); if(a>=1e6) return (n<0?'−':'')+'฿'+(a/1e6).toFixed(a>=1e7?1:2)+'M'; if(a>=1e3) return (n<0?'−':'')+'฿'+(a/1e3).toFixed(0)+'k'; return B(n); }
+function short(n){ const a=Math.abs(n); if(a>=1e6) return (n<0?'−':'')+'฿'+(a/1e6).toFixed(a>=1e7?1:2)+'M'; if(a>=1e3) return (n<0?'−':'')+'฿'+(a/1e3).toFixed(0)+'k'; return B(n,'r'); }
 const num = v => { const n = parseFloat(String(v??'').replace(/[,฿\s]/g,'')); return isFinite(n)?n:0; };
 const sum = arr => arr.reduce((a,b)=>a+(b||0),0);
 // Date formatters are created once and reused (creating them for every row is slow on phones)
@@ -545,18 +551,18 @@ const alerts = () => memo('al', _alerts);
 function _alerts(){
   const out = [];
   const su = sustainability();
-  if(su.state==='crit'||su.state==='warn') out.push({lvl:su.state==='crit'?'crit':'serious', text:`<b>Spending is eating into capital</b> by about ${B(su.gap)} a year.`, go:()=>go({tab:'plan'})});
+  if(su.state==='crit'||su.state==='warn') out.push({lvl:su.state==='crit'?'crit':'serious', text:`<b>Spending is eating into capital</b> by about ${B(su.gap,'r')} a year.`, go:()=>go({tab:'plan'})});
   S.buckets.forEach(b=>{
     const a = analyse(b);
     if(a.needs) out.push({lvl: a.reasons.some(r=>r.lvl==='serious')?'serious':'warn', text:`<b>${esc(b.name)}</b> needs rebalancing <span class="faint">(${a.reasons.map(r=>r.text.startsWith('Off')?'off target':r.text.startsWith('Sched')?'review due':'big market move').join(', ')})</span>`, go:()=>go({tab:'buckets',bucket:b.id})});
     if(a.tsum!==100 && holdingsOf(b.id).length) out.push({lvl:'warn', text:`<b>${esc(b.name)}</b>: target mix adds up to ${a.tsum}%, not 100%.`, go:()=>editBucket(b.id)});
     const gp = goalProjection(b);
-    if(gp && gp.funded<85) out.push({lvl:gp.funded<60?'serious':'warn', text:`<b>${esc(b.name)}</b> goal is ${Math.round(gp.funded)}% funded. Saving about ${B(gp.extra)} more a year would close the gap.`, go:()=>go({tab:'buckets',bucket:b.id})});
+    if(gp && gp.funded<85) out.push({lvl:gp.funded<60?'serious':'warn', text:`<b>${esc(b.name)}</b> goal is ${Math.round(gp.funded)}% funded. Saving about ${B(gp.extra,'r')} more a year would close the gap.`, go:()=>go({tab:'buckets',bucket:b.id})});
   });
   const em = emergencyStatus();
   if(em && em.months!==null && em.state!=='good'){
-    if(em.months < em.c.months) out.push({lvl:em.state, text:`<b>Emergency fund</b> covers ${em.months.toFixed(1)} months (target ${em.c.months}). Add about ${B(em.need)}.`, go:()=>go({tab:'plan'})});
-    else if(em.excess>0) out.push({lvl:'warn', text:`<b>Emergency fund</b> has ${B(em.excess)} more than ${em.c.excessMonths} months of costs — that could be invested.`, go:()=>go({tab:'plan'})});
+    if(em.months < em.c.months) out.push({lvl:em.state, text:`<b>Emergency fund</b> covers ${em.months.toFixed(1)} months (target ${em.c.months}). Add about ${B(em.need,'r')}.`, go:()=>go({tab:'plan'})});
+    else if(em.excess>0) out.push({lvl:'warn', text:`<b>Emergency fund</b> has ${B(em.excess,'r')} more than ${em.c.excessMonths} months of costs — that could be invested.`, go:()=>go({tab:'plan'})});
   }
   const dp = depositStatus();
   dp.over.forEach(x=>out.push({lvl:'warn', text:`<b>${esc(x.name)}</b>: ${B(x.v)} in cash — ${B(x.v-dp.c.dpLimit)} above the ${B(dp.c.dpLimit)} deposit protection limit.`, go:()=>go({tab:'plan'})}));
@@ -565,8 +571,8 @@ function _alerts(){
   const bs = budgetStatus(nowYear());
   if(bs.budget>0 && bs.state!=='good'){
     const msg = bs.state==='crit' ? `Over your ${nowYear()} budget by ${B(-bs.remaining)}.` :
-      bs.state==='serious' ? `On pace to spend ${B(bs.projected)} this year — ${B(bs.projected-bs.budget)} over budget.` :
-      `Spending is a little ahead of pace (${B(bs.spent)} vs ${B(bs.expected)} expected by today).`;
+      bs.state==='serious' ? `On pace to spend ${B(bs.projected,'r')} this year — ${B(bs.projected-bs.budget,'r')} over budget.` :
+      `Spending is a little ahead of pace (${B(bs.spent)} vs ${B(bs.expected,'r')} expected by today).`;
     out.push({lvl:bs.state, text:msg, go:()=>go({tab:'money'})});
   }
   const stale = S.holdings.filter(h=>h.type!=='cash' && daysBetween(h.updated||today(), today())>35);
@@ -605,7 +611,7 @@ function lineChart(el, series, opts={}){
     let bi=0, bd=1e18; xs.forEach((t,i)=>{ const d=Math.abs(X(t)-px); if(d<bd){bd=d;bi=i;} });
     const cx = X(xs[bi]); xh.setAttribute('x1',cx); xh.setAttribute('x2',cx); xh.style.display='';
     series.forEach((s,i)=>{ const c=svg.querySelector('.hd'+i); const p=s.pts[bi]; if(p){c.setAttribute('cx',cx);c.setAttribute('cy',Y(p[1]));c.style.display='';} });
-    tip.innerHTML = `<div class="faint">${opts.yearly? 'End of '+series[0].pts[bi][0].slice(0,4) : fmtDate(series[0].pts[bi][0])}</div>`+series.map(s=>`<div><span class="dot" style="background:${s.color};width:8px;height:8px"></span> ${esc(s.name)} <b class="num">${B(s.pts[bi]?.[1])}</b></div>`).join('');
+    tip.innerHTML = `<div class="faint">${opts.yearly? 'End of '+series[0].pts[bi][0].slice(0,4) : fmtDate(series[0].pts[bi][0])}</div>`+series.map(s=>`<div><span class="dot" style="background:${s.color};width:8px;height:8px"></span> ${esc(s.name)} <b class="num">${B(s.pts[bi]?.[1],'r')}</b></div>`).join('');
     tip.style.display='block';
     const left = cx*(r.width/W); tip.style.left = Math.min(Math.max(0,left-75), r.width-170)+'px'; tip.style.top='0px';
   };
@@ -770,7 +776,7 @@ function goalCard(b){
   const pts = [[nowYear()+'-01-01', bucketValue(b.id)], ...gp.years.map(y=>[y.y+'-12-31', Math.max(0,Math.round(y.end))])];
   UI._goalPts = pts;
   return `<div class="card"><div class="row between"><h2 style="margin:0">Goal</h2><button class="ghost" data-act="editGoal" data-id="${b.id}">Edit goal</button></div>
-    <div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${LVL[state][0]}">${ok?'✓':'!'}</span><div><b>${Math.round(Math.min(gp.funded,999))}% funded</b><div class="faint">${ok? 'On track at your assumed returns.' : `Save about <b>${B(gp.extra)}</b> more per year to be fully funded.`}${gp.runsOut?` Money runs out in ${gp.runsOut}.`:''}</div></div></div>
+    <div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${LVL[state][0]}">${ok?'✓':'!'}</span><div><b>${Math.round(Math.min(gp.funded,999))}% funded</b><div class="faint">${ok? 'On track at your assumed returns.' : `Save about <b>${B(gp.extra,'r')}</b> more per year to be fully funded.`}${gp.runsOut?` Money runs out in ${gp.runsOut}.`:''}</div></div></div>
     ${progressBar(gp.funded, LVL[state][0])}
     <div class="kv" style="margin-top:10px"><span class="k">${g.kind==='withdrawals'?'Planned spending':'Target'}</span><span class="num">${g.kind==='withdrawals'? (g.rows||[]).filter(r=>num(r.amt)>0).map(r=>`${B(num(r.amt))}/yr ${r.from}${r.to&&r.to!=r.from?'–'+r.to:''}`).join('<br>') : `${B(num(g.target.amt))} by ${g.target.year}`}</span></div>
     ${num(g.contrib?.amt)>0?`<div class="kv"><span class="k">You'll add</span><span class="num">${B(num(g.contrib.amt))}/yr until ${g.contrib.until}</span></div>`:''}
@@ -784,8 +790,8 @@ function rebalanceCard(b,plan){
   const a = plan.a; if(a.tsum!==100 || a.val<=0) return '';
   if(Object.values(b.targets||{}).filter(v=>v>0).length<=1) return '';
   const recs = [];
-  plan.sells.forEach(s=>{ if(s.amt>1) recs.push(`<div class="rec">Sell <b class="num">${B(s.amt)}</b> of ${TYPE_NAME[s.k]}${s.h?` — e.g. from <b>${esc(s.h.name)}</b>`:''}</div>`); });
-  plan.buys.forEach(x=>{ recs.push(`<div class="rec">Buy <b class="num">${B(x.amt)}</b> of ${TYPE_NAME[x.k]}${x.h?` — e.g. into <b>${esc(x.h.name)}</b>`:' — <i>no holding of this type yet</i>'}</div>`); });
+  plan.sells.forEach(s=>{ if(s.amt>1) recs.push(`<div class="rec">Sell <b class="num">${B(s.amt,'r')}</b> of ${TYPE_NAME[s.k]}${s.h?` — e.g. from <b>${esc(s.h.name)}</b>`:''}</div>`); });
+  plan.buys.forEach(x=>{ recs.push(`<div class="rec">Buy <b class="num">${B(x.amt,'r')}</b> of ${TYPE_NAME[x.k]}${x.h?` — e.g. into <b>${esc(x.h.name)}</b>`:' — <i>no holding of this type yet</i>'}</div>`); });
   return `<div class="card"><h2>Rebalancing</h2>
     ${a.reasons.length? a.reasons.map(r=>`<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:${LVL[r.lvl][0]}">!</span><div>${esc(r.text)}</div></div>`).join('') : `<div class="alert" style="border:0;padding:4px 0;cursor:default"><span class="ic" style="background:var(--good)">✓</span><div>Within limits. Next review: ${DF_DAY.format(a.due)}.</div></div>`}
     <h3>${a.needs?'Recommended moves':'To be exactly on target you would'}</h3>
@@ -838,11 +844,11 @@ function budgetCard(y,bs){
   return `<div class="card"><div class="row between"><h2 style="margin:0">${y} budget</h2>${statusPill(bs.state,label)}</div>
     <div class="row between" style="margin:10px 0 6px"><span><b class="num">${B(bs.spent)}</b> <span class="faint">of ${B(bs.budget)}</span></span><span class="faint num">${bs.remaining>=0?B(bs.remaining)+' left':B(-bs.remaining)+' over'}</span></div>
     <div class="bar"><div style="width:${Math.min(100,p)}%;background:${c}"></div><div class="pace" style="left:${pace}%"></div></div>
-    <div class="faint" style="margin-top:6px">Black line = where spending should be by today (${B(bs.expected)}).</div>
+    <div class="faint" style="margin-top:6px">Black line = where spending should be by today (${B(bs.expected,'r')}).</div>
     <div class="grid2" style="margin-top:10px">
       <div><div class="faint">This month</div><b class="num">${B(bs.thisMonth)}</b></div>
-      <div><div class="faint">Can spend / month left</div><b class="num">${B(Math.max(0,bs.perMonth))}</b></div>
-      <div><div class="faint">Projected year-end</div><b class="num">${B(bs.projected)}</b></div>
+      <div><div class="faint">Can spend / month left</div><b class="num">${B(Math.max(0,bs.perMonth),'r')}</b></div>
+      <div><div class="faint">Projected year-end</div><b class="num">${B(bs.projected,'r')}</b></div>
       <div style="text-align:right;align-self:end"><button class="ghost" data-act="setBudget">Change budget</button></div></div>
   </div>`;
 }
@@ -858,26 +864,26 @@ function viewPlan(){
   let verdict;
   if(!su.perm.length) verdict = `<div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:var(--warn)">?</span><div><b>Mark your permanent capital</b><div class="faint">Edit the bucket(s) whose principal should never be spent (e.g. Growth) and tick "Permanent capital".</div></div></div>`;
   else if(!S.expenses.length) verdict = `<div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:var(--warn)">?</span><div><b>Record your spending</b><div class="faint">Once you've logged some expenses (ideally a month or more), this shows whether your lifestyle is sustainable.</div></div></div>`;
-  else verdict = `<div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${LVL[su.state][0]}">${su.gap<=0?'✓':'!'}</span><div><b>${su.gap<=0?'Sustainable':'Eating into capital'}</b><div class="faint">${su.gap<=0?`You could spend about <b>${B(-su.gap)}</b> more a year and still keep capital growing with inflation.`:`You're spending about <b>${B(su.gap)}</b> a year more than your income plus what your permanent capital can safely give.`}</div></div></div>`;
+  else verdict = `<div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:${LVL[su.state][0]}">${su.gap<=0?'✓':'!'}</span><div><b>${su.gap<=0?'Sustainable':'Eating into capital'}</b><div class="faint">${su.gap<=0?`You could spend about <b>${B(-su.gap,'r')}</b> more a year and still keep capital growing with inflation.`:`You're spending about <b>${B(su.gap,'r')}</b> a year more than your income plus what your permanent capital can safely give.`}</div></div></div>`;
   return `<h1>Plan</h1>
   <div class="card"><h2>Is your lifestyle sustainable?</h2>
     <p class="help">Your rule: spending should never eat into capital. This checks your last 12 months of living costs against earned income plus what your permanent capital (♾ buckets) earns above inflation.</p>
     ${verdict}
     ${su.perm.length && S.expenses.length ? `
-    <div class="kv"><span class="k">Living costs per year</span><b class="num">${B(w.livingYr)}</b></div>
-    <div class="kv"><span class="k">− Earned income per year</span><b class="num">${B(w.earnedYr)}</b></div>
-    <div class="kv"><span class="k">− Safe draw from permanent capital</span><b class="num">${B(su.D)}</b></div>
-    <div class="kv"><span class="k">${su.gap<=0?'= Spare each year':'= Shortfall each year'}</span><b class="num ${su.gap<=0?'pos':'neg'}">${B(Math.abs(su.gap))}</b></div>
-    <p class="faint">Safe draw = ${B(su.P)} permanent capital × ${pct(su.real)} (expected ${pct(su.nom)} after fees − ${pct(S.settings.inflation)} inflation).${w.goalSpendYr?` Spending paid from goal buckets (${B(w.goalSpendYr)}/yr) is left out — it's planned.`:''}${w.short?` <b>Based on only ${w.days} days of records, scaled to a year — it gets more accurate over time.</b>`:''}</p>
+    <div class="kv"><span class="k">Living costs per year</span><b class="num">${B(w.livingYr,'r')}</b></div>
+    <div class="kv"><span class="k">− Earned income per year</span><b class="num">${B(w.earnedYr,'r')}</b></div>
+    <div class="kv"><span class="k">− Safe draw from permanent capital</span><b class="num">${B(su.D,'r')}</b></div>
+    <div class="kv"><span class="k">${su.gap<=0?'= Spare each year':'= Shortfall each year'}</span><b class="num ${su.gap<=0?'pos':'neg'}">${B(Math.abs(su.gap),'r')}</b></div>
+    <p class="faint">Safe draw = ${B(su.P)} permanent capital × ${pct(su.real)} (expected ${pct(su.nom)} after fees − ${pct(S.settings.inflation)} inflation).${w.goalSpendYr?` Spending paid from goal buckets (${B(w.goalSpendYr,'r')}/yr) is left out — it's planned.`:''}${w.short?` <b>Based on only ${w.days} days of records, scaled to a year — it gets more accurate over time.</b>`:''}</p>
     <h3>Financial independence</h3>
     <p class="help" style="margin-top:0">How close your permanent capital is to covering all living costs on its own, with no earned income.</p>
-    ${isFinite(su.fiNeed)?`${progressBar(su.fi, su.fi>=100?'var(--good)':'var(--accent)')}<div class="row between faint" style="margin-top:6px"><span><b class="num" style="color:var(--text)">${pct(su.fi,0)}</b> there</span><span>${B(su.P)} of ${B(su.fiNeed)}</span></div>`:'<div class="faint">Expected real return is zero or negative — raise it in Assumptions to see this.</div>'}
+    ${isFinite(su.fiNeed)?`${progressBar(su.fi, su.fi>=100?'var(--good)':'var(--accent)')}<div class="row between faint" style="margin-top:6px"><span><b class="num" style="color:var(--text)">${pct(su.fi,0)}</b> there</span><span>${B(su.P)} of ${B(su.fiNeed,'r')}</span></div>`:'<div class="faint">Expected real return is zero or negative — raise it in Assumptions to see this.</div>'}
     `:''}
   </div>
 
   ${safetyCard()}
   <div class="card"><h2>Goals</h2>
-    ${goalB.map(b=>{ const gp=goalProjection(b); const st=gp.funded>=100?'good':gp.funded>=85?'warn':'serious'; return `<div class="list-item" data-bucket="${b.id}"><div class="grow"><div class="row between"><span class="title">${esc(b.name)}</span><b class="num">${Math.round(Math.min(gp.funded,999))}%</b></div><div style="margin:6px 0 4px">${progressBar(gp.funded, LVL[st][0], 8)}</div><div class="faint">${gp.funded>=100?'Fully funded at assumed returns':`Save ~${B(gp.extra)}/yr more`}${gp.runsOut?` · runs out ${gp.runsOut}`:''}</div></div><span class="chev">›</span></div>`; }).join('') || '<p class="help" style="margin:0">No goals yet. Open a bucket (e.g. Education) and tap "Set a goal".</p>'}
+    ${goalB.map(b=>{ const gp=goalProjection(b); const st=gp.funded>=100?'good':gp.funded>=85?'warn':'serious'; return `<div class="list-item" data-bucket="${b.id}"><div class="grow"><div class="row between"><span class="title">${esc(b.name)}</span><b class="num">${Math.round(Math.min(gp.funded,999))}%</b></div><div style="margin:6px 0 4px">${progressBar(gp.funded, LVL[st][0], 8)}</div><div class="faint">${gp.funded>=100?'Fully funded at assumed returns':`Save ~${B(gp.extra,'r')}/yr more`}${gp.runsOut?` · runs out ${gp.runsOut}`:''}</div></div><span class="chev">›</span></div>`; }).join('') || '<p class="help" style="margin:0">No goals yet. Open a bucket (e.g. Education) and tap "Set a goal".</p>'}
   </div>
 
   <div class="card"><h2>Performance</h2>
@@ -890,8 +896,8 @@ function viewPlan(){
 
   <div class="card"><h2>Fees</h2>
     <p class="help">Yearly fund fees (TER). They're already taken out of fund prices, so you never see a bill — but they reduce your return every year.</p>
-    <div class="grid2"><div><div class="faint">Fees per year</div><div class="big">${B(feeYr)}</div></div><div><div class="faint">Average on investments</div><div class="big">${pct(feeAvg,2)}</div></div></div>
-    ${fees.length?`<h3>Most expensive</h3>${fees.slice(0,5).map(f=>`<div class="list-item" data-holding="${f.h.id}"><div class="grow"><div class="title">${esc(f.h.name)}</div><div class="faint">${f.h.ter}% a year on ${B(f.h.value)}</div></div><b class="num">${B(f.yr)}/yr</b></div>`).join('')}`:''}
+    <div class="grid2"><div><div class="faint">Fees per year</div><div class="big">${B(feeYr,'r')}</div></div><div><div class="faint">Average on investments</div><div class="big">${pct(feeAvg,2)}</div></div></div>
+    ${fees.length?`<h3>Most expensive</h3>${fees.slice(0,5).map(f=>`<div class="list-item" data-holding="${f.h.id}"><div class="grow"><div class="title">${esc(f.h.name)}</div><div class="faint">${f.h.ter}% a year on ${B(f.h.value)}</div></div><b class="num">${B(f.yr,'r')}/yr</b></div>`).join('')}`:''}
     ${S.holdings.some(h=>h.type!=='cash'&&!h.ter)?`<p class="faint">Some investments have no fee entered. Tap a holding → Edit → "Yearly fee (TER)". Find it in the fund's fact sheet.</p>`:''}
   </div>
 
@@ -1020,6 +1026,7 @@ function viewMore(){
     ${item('openHandover','📋','Family handover','A printable summary for your family')}
   </div>
   <div class="card menu">
+    ${item('lockSettings','🔒','App lock', Lock.on() ? 'On — '+(DEV.lock.cred?'fingerprint / screen lock':'app PIN') : 'Off — ask for fingerprint before opening')}
     ${item('openReview','🗓️','Annual review', (()=>{ const r=reviewStatus(); return `${r.year}: ${r.done} of ${r.total} done`; })())}
     ${item('setBudget','🎯','Yearly budget','Set or change the budget')}
     ${item('editCats','🏷️','Expense categories','Edit the list')}
@@ -1033,7 +1040,7 @@ function viewMore(){
     <input type="file" id="importFile" accept=".json,application/json" style="display:none">
   </div>
   <div class="card"><h2>Danger zone</h2><button class="danger" data-act="wipe">Clear all data</button></div>
-  <div class="faint" style="text-align:center">My Wealth v2.4 · all amounts in THB</div>`;
+  <div class="faint" style="text-align:center">My Wealth v2.6 · all amounts in THB</div>`;
 }
 function viewAccounts(){
   return `${backBtn('More',{tab:'more'})}<h1 style="margin-top:0">Accounts</h1>
@@ -1158,9 +1165,13 @@ en: { title:'How to use this app', intro:'Everything you need to know, in plain 
   <p><b>Stress test</b> shows what a market fall (e.g. −30%) would do to your wealth, goals and lifestyle check — without changing anything. Use it to make sure you could ride out a crash calmly.</p>
   <p><b>Glide path</b> (in Edit goal): for goals like education, the bucket's target mix gradually moves to a safer mix in the years before the money is needed. Rebalancing then follows it automatically.</p>
   <p><b>More → Annual review</b>: a yearly checklist (values, assumptions, goals, budget, insurance, fees, handover, backup, passphrase). Tick items as you go; you can add your own and choose the month it starts reminding you.</p>`},
+ {i:'🔒', t:'App lock', b:`
+  <p><b>More → App lock</b> makes the app ask for your <b>fingerprint, face or phone screen lock</b> before it opens — the same ones you use for your phone. Choose how soon it locks again after you leave the app (immediately, 1, 5 or 15 minutes).</p>
+  <p>If the fingerprint ever stops working, tap <b>Use family passphrase instead</b> on the lock screen. Set the lock up on each phone separately.</p>`},
  {i:'💾', t:'Backup, restore and changing phones', b:`
   <p>Because data lives only on this phone, you lose it if the phone is lost, reset, or Chrome's data is cleared.</p>
   <p><b>Back up:</b> <b>More → Back up now</b> → choose <b>Drive</b> (Google Drive) and save. Do it every week or two. The app reminds you after 14 days.</p>
+  <p>Backup files are <b>encrypted</b>: with family sync on, using the family passphrase; otherwise you choose a backup password. Nobody can read the file without it — keep it safe.</p>
   <p><b>Restore / new phone:</b> install the app on the new phone (open your link in Chrome → ⋮ → Install), then <b>More → Restore</b> and pick your latest backup file.</p>
   <p class="faint">Restoring replaces everything on that phone with the backup.</p>`},
  {i:'📱', t:'Setting up on a new phone', b:`
@@ -1304,9 +1315,13 @@ th: { title:'วิธีใช้แอป', intro:'ทุกอย่างท
   <p><b>Stress test</b> แสดงว่าถ้าตลาดตก (เช่น −30%) จะกระทบความมั่งคั่ง เป้าหมาย และความยั่งยืนอย่างไร โดยไม่เปลี่ยนข้อมูลจริง ใช้เพื่อมั่นใจว่ารับมือวิกฤตได้อย่างใจเย็น</p>
   <p><b>Glide path</b> (ใน Edit goal): สำหรับเป้าหมายอย่างการศึกษา สัดส่วนเป้าหมายจะค่อย ๆ ปรับเป็นแบบปลอดภัยขึ้นในช่วงปีก่อนต้องใช้เงิน และการปรับสมดุลจะตามให้อัตโนมัติ</p>
   <p><b>More → Annual review</b>: รายการตรวจประจำปี (มูลค่า สมมติฐาน เป้าหมาย งบประมาณ ประกัน ค่าธรรมเนียม เอกสารส่งต่อ ไฟล์สำรอง รหัสผ่านครอบครัว) ติ๊กเมื่อทำเสร็จ เพิ่มรายการเองได้ และเลือกเดือนที่เริ่มเตือนได้</p>`},
+ {i:'🔒', t:'ล็อกแอป', b:`
+  <p><b>More → App lock</b> ให้แอปขอ <b>ลายนิ้วมือ ใบหน้า หรือรหัสล็อกหน้าจอโทรศัพท์</b> ก่อนเปิด — แบบเดียวกับที่ใช้ปลดล็อกโทรศัพท์ เลือกได้ว่าจะล็อกอีกครั้งเร็วแค่ไหนหลังออกจากแอป (ทันที 1, 5 หรือ 15 นาที)</p>
+  <p>ถ้าลายนิ้วมือใช้ไม่ได้ แตะ <b>Use family passphrase instead</b> ที่หน้าล็อก ต้องตั้งค่าแยกในแต่ละเครื่อง</p>`},
  {i:'💾', t:'สำรองข้อมูล กู้คืน และเปลี่ยนโทรศัพท์', b:`
   <p>ข้อมูลอยู่ในโทรศัพท์เครื่องนี้เท่านั้น ถ้าเครื่องหาย ถูกรีเซ็ต หรือล้างข้อมูล Chrome ข้อมูลจะหายหมด</p>
   <p><b>สำรอง:</b> <b>More → Back up now</b> → เลือก <b>Drive</b> (Google Drive) แล้วบันทึก ทำทุก 1–2 สัปดาห์ แอปจะเตือนเมื่อครบ 14 วัน</p>
+  <p>ไฟล์สำรอง <b>ถูกเข้ารหัส</b>: ถ้าเปิดซิงค์ครอบครัว ใช้รหัสผ่านครอบครัว ถ้าไม่ได้เปิด จะให้ตั้งรหัสผ่านสำหรับไฟล์สำรอง ไม่มีใครอ่านไฟล์ได้หากไม่มีรหัส — เก็บไว้ให้ดี</p>
   <p><b>กู้คืน / เครื่องใหม่:</b> ติดตั้งแอปในเครื่องใหม่ (เปิดลิงก์ใน Chrome → ⋮ → Install) แล้วไปที่ <b>More → Restore</b> เลือกไฟล์สำรองล่าสุด</p>
   <p class="faint">การกู้คืนจะแทนที่ข้อมูลทั้งหมดในเครื่องนั้นด้วยข้อมูลจากไฟล์สำรอง</p>`},
  {i:'📱', t:'ติดตั้งในโทรศัพท์เครื่องใหม่', b:`
@@ -1465,12 +1480,12 @@ const Sync = {
     const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
     const key = await deriveKey(pass, salt); const check = await encrypt(key, {ok:'mywealth'});
     await this.api('PATCH', '/meta/vault', { fields: toFS({ salt, check, created:Date.now(), v:1 }).mapValue.fields });
-    this.key = key; await IDB.set('vaultKey', key);
+    this.key = key; await IDB.set('vaultKey', key); DEV.vaultMeta = { salt, check }; saveDev();
   },
   async unlock(pass, meta){
     const key = await deriveKey(pass, meta.salt);
     try{ const o = await decrypt(key, meta.check); if(o.ok!=='mywealth') throw 0; }catch(e){ throw new Error('WRONG_PASS'); }
-    this.key = key; await IDB.set('vaultKey', key);
+    this.key = key; await IDB.set('vaultKey', key); DEV.vaultMeta = { salt:meta.salt, check:meta.check }; saveDev();
   },
   markAll(){ KINDS.forEach(k=>S[k].forEach(r=>DIRTY.set(r.id,{kind:k,del:false}))); DIRTY.set('settings',{kind:'settings',del:false}); },
   ok(){ if(this.state!=='on'){ this.state='on'; this.err=''; scheduleRender(); } },
@@ -1545,6 +1560,7 @@ const Sync = {
       const key = await IDB.get('vaultKey');
       if(!key){ this.state='locked'; scheduleRender(); return; }
       this.key = key; this.listen(); scheduleRender();
+      if(!DEV.vaultMeta){ try{ const m = await this.vault(); if(m){ DEV.vaultMeta = { salt:m.salt, check:m.check }; saveDev(); } }catch(e){} }
     }catch(e){ this.fail(e); }
   },
   async stop(){
@@ -1567,7 +1583,7 @@ function applyRemote(id, o){
 let _rT = null;
 function typing(){ const a=document.activeElement; return !!a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && document.getElementById('app').contains(a); }
 // Background updates (e.g. from the other phone) wait until you've finished typing on the page
-function scheduleRender(){ clearTimeout(_rT); _rT = setTimeout(()=>{ if(typing()){ scheduleRender(); return; } UI.keepScroll = true; render(); }, 250); }
+function scheduleRender(){ clearTimeout(_rT); _rT = setTimeout(()=>{ if(typing()){ scheduleRender(); return; } if(Lock.locked) return; UI.keepScroll = true; render(); }, 250); }
 
 function syncPill(){
   if(DEV.mode!=='cloud') return '';
@@ -1735,7 +1751,7 @@ const ACT = {
   addHolding: id=>editHolding(null, id), addExpense: ()=>expenseForm(), addIncome: ()=>incomeForm(),
   addPolicy: ()=>editPolicy(null), editGoal: id=>editGoal(id),
   setBudget: ()=>budgetForm(),
-  editSafety: ()=>editSafety(), stressTest: ()=>stressTest(), openReview: ()=>go({tab:'more',sub:'review'}),
+  lockSettings: ()=>lockSettings(), editSafety: ()=>editSafety(), stressTest: ()=>stressTest(), openReview: ()=>go({tab:'more',sub:'review'}),
   reviewCustom: ()=>{ const c = reviewCfg(); sheet('Your own review items', `<label>One per line</label><textarea id="rc" rows="8" placeholder="e.g. Check the kids' savings accounts">${esc(c.custom.join('\n'))}</textarea><div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{ el.querySelector('#ok').onclick=()=>{ closeSheet(); setReview(x=>{ x.custom = val(el,'rc').split('\n').map(t=>t.trim()).filter(Boolean); }); }; }); }, editCats: ()=>listForm('categories','Expense categories'), editSources: ()=>listForm('sources','Income sources'),
   editAssume: ()=>assumeForm(), editHandover: ()=>handoverForm(),
   openAccounts: ()=>go({tab:'more',sub:'accounts'}), openGuide: ()=>go({tab:'more',sub:'guide'}), openInsurance: ()=>go({tab:'more',sub:'insurance'}), openHandover: ()=>go({tab:'more',sub:'handover'}),
@@ -1745,7 +1761,7 @@ const ACT = {
   openSync: ()=>go({tab:'more',sub:'sync'}),
   export: exportData, import: ()=>document.getElementById('importFile').click(),
   wipe: ()=>confirmSheet(DEV.mode==='cloud' ? 'Clear ALL data on BOTH phones (family sync is on)? This cannot be undone. Back up first.' : 'Clear ALL data on this phone? This cannot be undone. Back up first if unsure.','Clear everything',()=>{ replaceAll(blank()); go({tab:'home'}); toast('All data cleared'); }),
-  split: id=>{ const C=num(document.getElementById('contrib').value); const out=document.getElementById('splitOut'); if(C<=0){out.innerHTML='';return;} out.innerHTML = contributionSplit(bkt(id),C).filter(x=>x.amt>0.5).map(x=>`<div class="rec"><span class="dot" style="background:${tColor(x.k)};width:8px;height:8px"></span> Put <b class="num">${B(x.amt)}</b> into ${TYPE_NAME[x.k]}</div>`).join(''); },
+  split: id=>{ const C=num(document.getElementById('contrib').value); const out=document.getElementById('splitOut'); if(C<=0){out.innerHTML='';return;} out.innerHTML = contributionSplit(bkt(id),C).filter(x=>x.amt>0.5).map(x=>`<div class="rec"><span class="dot" style="background:${tColor(x.k)};width:8px;height:8px"></span> Put <b class="num">${B(x.amt,'r')}</b> into ${TYPE_NAME[x.k]}</div>`).join(''); },
   reviewed: id=>{ const b=bkt(id); const bt=byType(id); b.lastReview=today(); b.baseline={ invested: bucketValue(id)-bt.cash, at:Date.now() }; put('buckets', b); save(); UI.keepScroll=true; render(); toast('Marked as reviewed'); }
 };
 
@@ -2070,7 +2086,7 @@ function budgetForm(yr){
     <div class="faint">About <span id="pm">—</span> per month.</div>
     <div class="actions"><button class="primary" id="ok">Save</button></div>`, el=>{
     const ba=el.querySelector('#ba'), by=el.querySelector('#by');
-    const upd=()=>el.querySelector('#pm').textContent=B(num(ba.value)/12); ba.oninput=upd; upd();
+    const upd=()=>el.querySelector('#pm').textContent=B(num(ba.value)/12,'r'); ba.oninput=upd; upd();
     by.oninput=()=>{ ba.value=S.settings.budgets[by.value]||''; upd(); };
     el.querySelector('#ok').onclick=()=>{ S.settings.budgets[by.value]=num(ba.value); putSettings(); after(); };
   });
@@ -2101,24 +2117,69 @@ function handoverForm(){
 }
 
 /* ================= Backup ================= */
+/* Backups are encrypted: with sync on, using the family passphrase; without sync, with a backup password you choose. */
 async function exportData(){
+  if(DEV.mode==='cloud' && Sync.key && DEV.vaultMeta){
+    try{ const enc = await encrypt(Sync.key, S); return writeBackup({ enc:'family', salt:DEV.vaultMeta.salt, iv:enc.iv, c:enc.c }); }
+    catch(e){ return toast('Could not create the backup: '+e.message); }
+  }
+  sheet('Back up', `<p class="help">Lock the backup file with a password, so nobody can read it if the file ever gets out. You'll need this password to restore it — keep it with your important documents.</p>
+    <label>Backup password</label><input id="bp1" type="password" autocomplete="new-password">
+    <label>Type it again</label><input id="bp2" type="password" autocomplete="new-password">
+    <div id="bpErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions"><button class="primary" id="bpGo">Save backup</button></div>
+    <button class="ghost" id="bpPlain" style="margin-top:6px">Save without a password (not recommended)</button>`, el=>{
+    el.querySelector('#bpGo').onclick = async ()=>{
+      const a = val(el,'bp1'), b = val(el,'bp2'), err = el.querySelector('#bpErr');
+      if(a.length < 8) return err.textContent = 'Use at least 8 characters.';
+      if(a !== b) return err.textContent = 'The two passwords don\'t match.';
+      busy(el.querySelector('#bpGo'), true, 'Encrypting…');
+      const salt = b64(crypto.getRandomValues(new Uint8Array(16))); const key = await deriveKey(a, salt); const enc = await encrypt(key, S);
+      closeSheet(); writeBackup({ enc:'password', salt, iv:enc.iv, c:enc.c });
+    };
+    el.querySelector('#bpPlain').onclick = ()=>{ closeSheet(); writeBackup(null); };
+  });
+}
+async function writeBackup(enc){
   DEV.lastBackup = today(); saveDev(); bump();
-  const json = JSON.stringify(S);
-  const name = `mywealth-backup-${today()}.json`;
-  const file = new File([json], name, {type:'application/json'});
+  const body = enc ? JSON.stringify({ format:'mywealth-backup', v:2, created:today(), ...enc }) : JSON.stringify(S);
+  const name = `mywealth-backup-${today()}${enc?'':'-UNENCRYPTED'}.json`;
+  const file = new File([body], name, {type:'application/json'});
   try{
-    if(navigator.canShare && navigator.canShare({files:[file]})){ await navigator.share({files:[file], title:'My Wealth backup'}); UI.keepScroll=true; render(); toast('Backup shared — save it to Google Drive'); return; }
+    if(navigator.canShare && navigator.canShare({files:[file]})){ await navigator.share({files:[file], title:'My Wealth backup'}); UI.keepScroll=true; render(); toast(enc ? 'Encrypted backup shared — save it to Google Drive' : 'Backup shared'); return; }
   }catch(e){ if(e.name==='AbortError') return; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; document.body.appendChild(a); a.click(); a.remove();
-  UI.keepScroll=true; render(); toast('Backup saved to your Downloads');
+  UI.keepScroll=true; render(); toast(enc ? 'Encrypted backup saved to your Downloads' : 'Backup saved to your Downloads');
 }
 function importFile(ev){
   const f = ev.target.files[0]; if(!f) return;
   const r = new FileReader();
-  r.onload = ()=>{ try{ const d=JSON.parse(r.result); if(!d || !Array.isArray(d.holdings)) throw new Error('Not a My Wealth backup');
-      confirmSheet(`Replace everything ${DEV.mode==='cloud'?'on BOTH phones':'on this phone'} with this backup?`,'Restore',()=>{ replaceAll(migrate(d)); go({tab:'home'}); toast('Restored'); });
+  r.onload = ()=>{ try{
+      const d = JSON.parse(r.result);
+      if(d && d.format==='mywealth-backup' && d.c) return restoreEncrypted(d);
+      if(!d || !Array.isArray(d.holdings)) throw new Error('Not a My Wealth backup');
+      confirmRestore(d);
     }catch(e){ toast('Could not read that file: '+e.message); } };
   r.readAsText(f); ev.target.value='';
+}
+async function restoreEncrypted(d){
+  if(d.enc==='family' && Sync.key && DEV.vaultMeta && DEV.vaultMeta.salt===d.salt){
+    try{ return confirmRestore(await decrypt(Sync.key, d)); }catch(e){}
+  }
+  sheet('Restore backup', `<p class="help">${d.enc==='family' ? 'This backup is locked with the <b>family passphrase</b>.' : 'This backup is locked with its <b>backup password</b>.'}${d.created?` Made on ${fmtDate(d.created)}.`:''}</p>
+    <label>${d.enc==='family'?'Family passphrase':'Backup password'}</label><input id="rp" type="password">
+    <div id="rpErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions"><button class="primary" id="rpGo">Unlock backup</button></div>`, el=>{
+    el.querySelector('#rpGo').onclick = async ()=>{
+      const btn = el.querySelector('#rpGo'); busy(btn, true, 'Unlocking…');
+      try{ const key = await deriveKey(val(el,'rp'), d.salt); const data = await decrypt(key, d); closeSheet(); confirmRestore(data); }
+      catch(e){ busy(btn, false); el.querySelector('#rpErr').textContent = 'That doesn\'t unlock this backup. Check capitals and spaces.'; }
+    };
+  });
+}
+function confirmRestore(d){
+  if(!d || !Array.isArray(d.holdings)) return toast('Not a My Wealth backup');
+  confirmSheet(`Replace everything ${DEV.mode==='cloud'?'on BOTH phones':'on this phone'} with this backup?`,'Restore',()=>{ replaceAll(migrate(d)); go({tab:'home'}); toast('Restored'); });
 }
 
 /* Replace all data (restore / clear). With sync on, the old records are deleted for both phones. */
@@ -2130,6 +2191,97 @@ function replaceAll(newS){
     S.settings.at = Date.now(); DIRTY.set('settings',{kind:'settings',del:false});
   } else { S = newS; }
   save();
+}
+
+/* ================= App lock ================= */
+async function hashPin(pin, salt){
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
+  return b64(new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2', salt:unb64(salt), iterations:150000, hash:'SHA-256'}, base, 256)));
+}
+const Lock = {
+  locked:false, hiddenAt:0, ready:false,
+  on(){ return !!(DEV.lock && DEV.lock.on); },
+  async supported(){ try{ return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); }catch(e){ return false; } },
+  altKind(){ if(!DEV.lock?.cred) return DEV.lock?.pin ? 'pin' : null;   // PIN-only lock
+    return (DEV.mode==='cloud' && DEV.vaultMeta) ? 'pass' : (DEV.lock?.pin ? 'pin' : null); },   // backup for the fingerprint
+  show(){
+    if(!this.on()) return;
+    this.locked = true; closeSheet();
+    let el = document.getElementById('lock'); if(!el){ el = document.createElement('div'); el.id = 'lock'; document.body.appendChild(el); }
+    const bio = !!DEV.lock.cred, alt = this.altKind();
+    el.innerHTML = `<div class="lockbox"><img src="icon-192.png" alt="" width="64" height="64" style="border-radius:16px">
+      <h2 style="margin:14px 0 4px">My Wealth is locked</h2><div class="faint" style="margin-bottom:18px">${bio?'Use your fingerprint, face or phone screen lock.':'Enter your app PIN.'}</div>
+      ${bio?`<button class="primary block" id="lkBio">🔓 Unlock</button>`:''}
+      <div id="lkAlt" style="${bio?'display:none':''};margin-top:12px">
+        <input id="lkIn" type="password" ${alt==='pin'?'inputmode="numeric"':''} placeholder="${alt==='pass'?'Family passphrase':'App PIN'}" autocomplete="off">
+        <button class="${bio?'':'primary '}block" id="lkGo" style="margin-top:8px">Unlock</button>
+      </div>
+      ${bio && alt ? `<button class="ghost" id="lkShowAlt" style="margin-top:10px">Use ${alt==='pass'?'family passphrase':'app PIN'} instead</button>` : ''}
+      <div id="lkMsg" class="neg" style="margin-top:10px;min-height:20px"></div></div>`;
+    const msg = t => el.querySelector('#lkMsg').textContent = t;
+    if(bio){ el.querySelector('#lkBio').onclick = ()=>this.bio(msg); }
+    const sa = el.querySelector('#lkShowAlt'); if(sa) sa.onclick = ()=>{ el.querySelector('#lkAlt').style.display=''; sa.remove(); el.querySelector('#lkIn').focus(); };
+    el.querySelector('#lkGo').onclick = ()=>this.alt(el.querySelector('#lkIn').value, msg);
+    el.querySelector('#lkIn').onkeydown = e => { if(e.key==='Enter') this.alt(e.target.value, msg); };
+    if(bio) setTimeout(()=>this.bio(()=>{}), 250);   // ask for the fingerprint straight away
+  },
+  async bio(msg){
+    try{
+      await navigator.credentials.get({ publicKey:{ challenge:crypto.getRandomValues(new Uint8Array(32)), rpId:location.hostname,
+        allowCredentials:[{ type:'public-key', id:unb64(DEV.lock.cred) }], userVerification:'required', timeout:60000 } });
+      this.unlocked();
+    }catch(e){ msg(e && e.name==='NotAllowedError' ? 'Not unlocked. Tap Unlock to try again.' : 'Fingerprint / screen lock not available. Use the other option.'); const a=document.getElementById('lkShowAlt'); if(a && e.name!=='NotAllowedError') a.click(); }
+  },
+  async alt(v, msg){
+    const kind = this.altKind(); if(!v) return msg('Enter it first.');
+    try{
+      if(kind==='pass'){ const key = await deriveKey(v, DEV.vaultMeta.salt); const o = await decrypt(key, DEV.vaultMeta.check); if(o.ok!=='mywealth') throw 0; }
+      else if(kind==='pin'){ if(await hashPin(v, DEV.lock.pin.salt) !== DEV.lock.pin.hash) throw 0; }
+      else throw 0;
+      this.unlocked();
+    }catch(e){ msg(kind==='pass' ? 'Wrong passphrase.' : 'Wrong PIN.'); }
+  },
+  unlocked(){ this.locked = false; this.hiddenAt = 0; document.getElementById('lock')?.remove(); if(!this.ready){ this.ready = true; } UI.keepScroll = true; render(); }
+};
+document.addEventListener('visibilitychange', ()=>{
+  if(!Lock.on() || Lock.locked) return;
+  if(document.hidden){ Lock.hiddenAt = Date.now(); if(!(DEV.lock.after>0)) Lock.show(); }
+  else if(Lock.hiddenAt && Date.now() - Lock.hiddenAt >= (DEV.lock.after||0)*60000) Lock.show();
+});
+async function lockSettings(){
+  const sup = await Lock.supported(), on = Lock.on(), cloud = DEV.mode==='cloud' && DEV.vaultMeta;
+  const needPin = !on && (!sup || !cloud);
+  const after = DEV.lock?.after ?? 1;
+  sheet('App lock', `
+    <p class="help">${sup ? 'Ask for your <b>fingerprint, face or phone screen lock</b> — the same ones you use to unlock your phone — before showing the app.' : 'This phone can\'t use fingerprint for web apps, so the app uses its own PIN.'}</p>
+    ${on ? `<div class="verdict" style="background:var(--surface-2)"><span class="ic" style="background:var(--good)">✓</span><div><b>App lock is on</b><div class="faint">${DEV.lock.cred?'Fingerprint / screen lock':'App PIN'}${Lock.altKind()==='pass'?' · family passphrase as backup':Lock.altKind()==='pin'&&DEV.lock.cred?' · app PIN as backup':''}</div></div></div>`:''}
+    <label>Lock again after the app has been in the background for</label>
+    <select id="lkAfter">${[[0,'Immediately'],[1,'1 minute'],[5,'5 minutes'],[15,'15 minutes']].map(([v,t])=>`<option value="${v}" ${after===v?'selected':''}>${t}</option>`).join('')}</select>
+    ${needPin ? `<label>${sup?'Backup PIN (in case fingerprint isn\'t available)':'App PIN'} — 4 to 8 digits</label><input id="lkP1" type="password" inputmode="numeric" maxlength="8"><label>Type it again</label><input id="lkP2" type="password" inputmode="numeric" maxlength="8">` : ''}
+    ${!on && cloud && sup ? `<div class="faint" style="margin-top:8px">If the fingerprint ever stops working, your family passphrase also unlocks the app.</div>` : ''}
+    <div id="lkErr" class="neg" style="margin-top:8px"></div>
+    <div class="actions">${on ? '<button class="danger" id="lkOff">Turn off</button><button class="primary" id="lkSave">Save</button>' : '<button class="primary" id="lkOn">Turn on app lock</button>'}</div>
+    <p class="faint">This lock is for this phone only. Set it up on each phone.</p>`, el=>{
+    const err = t => el.querySelector('#lkErr').textContent = t;
+    const afterVal = () => +el.querySelector('#lkAfter').value;
+    const sv = el.querySelector('#lkSave'); if(sv) sv.onclick = ()=>{ DEV.lock.after = afterVal(); saveDev(); closeSheet(); toast('Saved'); };
+    const off = el.querySelector('#lkOff'); if(off) off.onclick = ()=>{ DEV.lock = { on:false }; saveDev(); closeSheet(); render(); toast('App lock is off'); };
+    const onBtn = el.querySelector('#lkOn'); if(onBtn) onBtn.onclick = async ()=>{
+      let pin = null;
+      if(needPin){ const a = val(el,'lkP1'), b = val(el,'lkP2'); if(!/^\d{4,8}$/.test(a)) return err('PIN must be 4 to 8 digits.'); if(a!==b) return err('The two PINs don\'t match.'); const salt = b64(crypto.getRandomValues(new Uint8Array(16))); pin = { salt, hash: await hashPin(a, salt) }; }
+      let cred = null;
+      if(sup){
+        try{
+          const c = await navigator.credentials.create({ publicKey:{ challenge:crypto.getRandomValues(new Uint8Array(32)),
+            rp:{ name:'My Wealth', id:location.hostname }, user:{ id:crypto.getRandomValues(new Uint8Array(16)), name:'My Wealth app lock', displayName:'My Wealth app lock' },
+            pubKeyCredParams:[{type:'public-key', alg:-7}, {type:'public-key', alg:-257}],
+            authenticatorSelection:{ authenticatorAttachment:'platform', userVerification:'required', residentKey:'discouraged' }, timeout:60000, attestation:'none' } });
+          cred = b64(new Uint8Array(c.rawId));
+        }catch(e){ return err(e && e.name==='NotAllowedError' ? 'Cancelled. Tap "Turn on app lock" again and confirm with your fingerprint or screen lock.' : 'Couldn\'t set up the fingerprint lock: ' + (e && e.message || e)); }
+      }
+      DEV.lock = { on:true, cred, pin, after:afterVal() }; saveDev(); closeSheet(); render(); toast('App lock is on');
+    };
+  });
 }
 
 /* ================= Demo data ================= */
@@ -2192,7 +2344,7 @@ try{ history.replaceState({tab:'home',bucket:null,sub:null},''); }catch(e){}
 (async ()=>{
   await loadState();
   if(S.holdings.length) save();
-  render();
+  if(Lock.on()) Lock.show(); else render();
   if(DEV.mode==='cloud') Sync.resume();
 })();
 window.addEventListener('online', ()=>{ if(DEV.mode==='cloud'){ if(!Sync.user) Sync.resume(); else Sync.poll(); } scheduleRender(); });
